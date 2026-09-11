@@ -178,7 +178,7 @@ class SyntheticDataGenerator:
         with get_conn(DB_HISTORY) as conn:
             conn.executemany("""
             INSERT INTO listens (user_id, song_id, started_at, completion_pct, source)
-            VALUES (?, ?, ?, ?, 'synthetic')
+            VALUES (?, ?, ?, ?, ?)
             """, [
                 (u, s, time.time() - random.uniform(0, 86400*30),
                  max(0, min(1, (r + 1) / 2.0)), 'synthetic')
