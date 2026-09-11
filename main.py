@@ -36,29 +36,30 @@ Point NeuroSync at your Parlay bot WITHOUT editing any file:
 
     export PARLAY_PUSH_CALLBACK="mypkg.telegram_bot:push_recommendations"
 
-The target must be an async function `(user_id: int, recs: list[dict]) -> None`.
-Each rec dict carries: session_id, song_id, rank, title, channel, yt_url,
-thumbnail, final_score, why. The "+" / "−" callback buttons should be attached
-there and wired back to `NeuroSyncPipeline.record_feedback(...)`.
-If PARLAY_PUSH_CALLBACK is unset, the built-in logging stub is used, which
-renders the keyboard layout into the log so a cycle can be verified.
+Built-in Telegram delivery (stdlib only, no new deps):
 
-Known gaps in the existing modules (pre-existing, NOT fixed by this entrypoint)
-───────────────────────────────────────────────────────────────────────────────
-  * scheduler/jobs.py registers rec_push as
-        lambda: asyncio.create_task(rec_push_job(user_ids))
-    AsyncIOScheduler runs a sync callable on an executor thread, where there is
-    no running event loop, so that lambda raises "no running event loop".
-    `python main.py --once` is the working push path until jobs.py is fixed.
-  * trainer/engine.py SyntheticDataGenerator.seed_db() supplies 5 parameters
-    for a 4-placeholder INSERT, so --bootstrap / use_synthetic=True raises
-    ProgrammingError. See the boot-time error handler below for the hint.
+    export TELEGRAM_BOT_TOKEN="123456:ABC-..."
+    export PARLAY_PUSH_CALLBACK="notifier.telegram:push_recommendations"
+    python -m notifier.owner_profile          # seed AgainOwner taste once
+    python main.py --once --user-ids 6802929470
+
+If PARLAY_PUSH_CALLBACK is unset but TELEGRAM_BOT_TOKEN is set, the
+built-in notifier.telegram:push_recommendations is used automatically.
+Otherwise the logging stub renders the keyboard layout into the log.
+
+Fixed in this tree (were Known gaps)
+───────────────────────────────────
+  * scheduler/jobs.py rec_push now passes the coroutine + args directly
+    to AsyncIOScheduler, so the hourly push fires.
+  * trainer/engine.py seed_db() now uses 5 placeholders for 5 params.
 
 Recipients
 ──────────
 `scheduler/jobs.build_scheduler()` takes a fixed `user_ids` list, so recipients
 are resolved once at boot from the listened/feedback data
-(`--user-ids 1,2,3` overrides). New users are picked up on the next restart.
+(`--user-ids 1,2,3` overrides). AgainOwner (6802929470) is always included
+in auto-discovery so the first run pushes even before any listen exists.
+New users are picked up on the next restart.
 
 Usage
 ─────
@@ -171,6 +172,8 @@ def get_active_users(explicit: Optional[list[int]] = None) -> list[int]:
     There is no separate users table — a user is anyone who has produced a
     listen record (DB_HISTORY.listens) or a +/− feedback signal
     (DB_FEEDBACK.feedback). Pass --user-ids to bypass discovery.
+    AgainOwner is always included in auto-discovery so Telegram delivery
+    works on a cold boot (see notifier.owner_profile).
     """
     if explicit:
         return sorted({int(u) for u in explicit})
@@ -183,6 +186,12 @@ def get_active_users(explicit: Optional[list[int]] = None) -> list[int]:
     with get_conn(DB_FEEDBACK) as conn:
         rows = conn.execute("SELECT DISTINCT user_id FROM feedback").fetchall()
         users.update(r["user_id"] for r in rows)
+
+    try:
+        from config import OWNER_TELEGRAM_ID
+        users.add(int(OWNER_TELEGRAM_ID))
+    except Exception:
+        pass
 
     return sorted(users)
 
@@ -210,15 +219,25 @@ async def _logging_push_callback(user_id: int, recs: list) -> None:
 def resolve_push_callback() -> Callable[[int, list], Awaitable[None]]:
     """
     Load the Parlay bot hook from PARLAY_PUSH_CALLBACK ("module.path:function").
-    Falls back to the logging stub on any import/shape mismatch.
+    If unset but TELEGRAM_BOT_TOKEN is configured, use the built-in
+    notifier.telegram:push_recommendations so the pipeline is complete
+    out of the box. Falls back to the logging stub otherwise.
     """
     spec = os.environ.get("PARLAY_PUSH_CALLBACK", "").strip()
     if not spec:
-        logger.warning(
-            "PARLAY_PUSH_CALLBACK not set — using the logging stub. "
-            "Set it to \"module.path:async_fn\" to deliver to the Parlay bot."
-        )
-        return _logging_push_callback
+        try:
+            from config import TELEGRAM_BOT_TOKEN
+        except Exception:
+            TELEGRAM_BOT_TOKEN = ""
+        if TELEGRAM_BOT_TOKEN:
+            spec = "notifier.telegram:push_recommendations"
+        else:
+            logger.warning(
+                "PARLAY_PUSH_CALLBACK not set — using the logging stub. "
+                "Set it to \"module.path:async_fn\" or set TELEGRAM_BOT_TOKEN "
+                "to deliver Top-10 to AgainOwner via notifier.telegram."
+            )
+            return _logging_push_callback
 
     module_path, _, attr = spec.partition(":")
     try:
@@ -286,13 +305,7 @@ async def _async_main(args: argparse.Namespace) -> int:
                 ),
             )
         except Exception as e:
-            logger.error(
-                "Training failed (%s) — aborting. If this was --bootstrap, the cause is "
-                "the known SQL binding bug in trainer/engine.py "
-                "SyntheticDataGenerator.seed_db() (5 params supplied for 4 placeholders).",
-                e,
-                exc_info=True,
-            )
+            logger.error("Training failed (%s) — aborting.", e, exc_info=True)
             return 1
         logger.info("Training complete → %s", metrics)
     else:
@@ -342,17 +355,6 @@ async def _async_main(args: argparse.Namespace) -> int:
         return 0
 
     # ── 6. Scheduler: build → start (after the loop is running) → wait ──
-    # scheduler/jobs.py registers rec_push as
-    #     lambda: asyncio.create_task(rec_push_job(user_ids))
-    # AsyncIOScheduler runs a sync callable on an executor thread, where there is
-    # no running event loop, so that lambda cannot fire. Warn rather than report
-    # a healthy scheduler while the documented hourly push silently does nothing.
-    logger.warning(
-        "rec_push is registered via a sync lambda in scheduler/jobs.py that calls "
-        "asyncio.create_task() off-loop — the hourly push will NOT fire until "
-        "build_scheduler passes the coroutine function directly. Use --once to push."
-    )
-
     scheduler = jobs.build_scheduler(user_ids)
     if scheduler is None:
         logger.error(

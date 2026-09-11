@@ -124,8 +124,9 @@ def build_scheduler(user_ids: list):
         replace_existing=True,
     )
     scheduler.add_job(
-        lambda: asyncio.create_task(rec_push_job(user_ids)),
+        rec_push_job,
         IntervalTrigger(seconds=REC_PUSH_INTERVAL),
+        args=[user_ids],
         id="rec_push",
         name="Rec Push",
         replace_existing=True,

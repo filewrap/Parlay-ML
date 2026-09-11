@@ -133,6 +133,17 @@ REWARD_SKIP_FAST    = -0.5   # skipped < 10s
 REWARD_FULL_PLAY    = +0.8   # completed >80% of song
 REWARD_PARTIAL_PLAY = +0.2   # 30–80% completion
 
+# ─── Telegram push (AgainOwner) ───────────────────────────
+# Stdlib-only Bot API push. No new pip deps.
+#   export TELEGRAM_BOT_TOKEN="123456:ABC-..."
+#   # optional overrides (defaults to the owner below):
+#   export TELEGRAM_CHAT_ID="6802929470"
+#   export PARLAY_PUSH_CALLBACK="notifier.telegram:push_recommendations"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+OWNER_TELEGRAM_ID = int(os.environ.get("TELEGRAM_OWNER_ID", "6802929470"))
+OWNER_USERNAME = os.environ.get("TELEGRAM_OWNER_USERNAME", "AgainOwner")
+
 # ─── Fibonacci sequence (used for energy normalisation) ───
 def fib_sequence(n: int) -> list[int]:
     a, b = 1, 1
