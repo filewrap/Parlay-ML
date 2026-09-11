@@ -233,12 +233,15 @@ class TFIDFContentScorer:
             return None
 
         with get_conn(DB_HISTORY) as conn:
+            # NOTE: listens lives in DB_HISTORY while songs lives in
+            # DB_CATALOG (separate SQLite files, no ATTACH), so this
+            # must NOT JOIN songs here. Title is resolved from the
+            # in-memory TF-IDF vectors below, not from SQL.
             rows = conn.execute("""
-                SELECT l.song_id, l.completion_pct, s.title
-                FROM listens l
-                LEFT JOIN songs s ON s.song_id = l.song_id
-                WHERE l.user_id = ?
-                ORDER BY l.started_at DESC
+                SELECT song_id, completion_pct
+                FROM listens
+                WHERE user_id = ?
+                ORDER BY started_at DESC
                 LIMIT 200
             """, (user_id,)).fetchall()
 
