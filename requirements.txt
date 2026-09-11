@@ -1,0 +1,44 @@
+# ═══════════════════════════════════════════════════════════
+#  PARLAY ML — NEUROSYNC ENGINE v1.0
+#  Runtime requirements for `python main.py`
+#
+#  This is the COMPLETE third-party dependency set of the engine,
+#  derived from the actual imports in the codebase:
+#
+#    numpy        core/database.py, models/*, pipeline/*, trainer/*
+#    torch        models/ncf_model.py          (NCF: GMF + MLP fusion)
+#    APScheduler  scheduler/jobs.py            (AsyncIOScheduler)
+#    yt-dlp       core/scraper.py              (subprocess search engine)
+#
+#  Install:  pip install -r requirements.txt
+#            python main.py --bootstrap
+# ═══════════════════════════════════════════════════════════
+
+# ─── Core numerics ─────────────────────────────────────────
+# Latent-factor matrices (FunkSVD), embeddings, Thompson sampling,
+# TF-IDF vectors, numpy BLOB (de)serialisation in core/database.py.
+numpy>=2.0
+
+# ─── Scheduler ─────────────────────────────────────────────
+# scheduler/jobs.py:build_scheduler() → AsyncIOScheduler + IntervalTrigger.
+# Drives feed_refresh (1h), rec_push (1h), retrain (6h), catalog_clean (24h).n# Capped <4: jobs.py imports `apscheduler.schedulers.asyncio.AsyncIOScheduler`
+# and `apscheduler.triggers.interval.IntervalTrigger`, both of which the 4.x
+# line removed/renamed. On a 4.x resolve, build_scheduler()'s own
+# `except ImportError` would swallow it and report a misleading
+# "APScheduler not installed".
+APScheduler>=3.10,<4
+
+# ─── YouTube feed scraper ──────────────────────────────────
+# Used as a CLI subprocess by core/scraper.py:_extract_via_ytdlp()
+# (`yt-dlp --dump-json --flat-playlist ytsearchN:<query>`).
+# It is NOT imported as a Python module.
+yt-dlp>=2024.1.1
+
+# ─── NCF (Neural Collaborative Filtering) ──────────────────
+# models/ncf_model.py: GMF + MLP fusion net, Adam + CosineAnnealingLR.
+# Verified installable on the target host (Termux aarch64, Python 3.14.6):
+# torch 2.14.0 publishes cp314 + aarch64 wheels, so the plain pip path works.
+# ncf_model.py guards this import (TORCH_AVAILABLE) and the engine degrades
+# gracefully without it — but the documented 4-way ensemble (W_NCF = 0.25)
+# needs it.
+torch>=2.0
