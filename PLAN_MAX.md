@@ -163,8 +163,14 @@ latency flat.
 - `/why this` in words (translate `why_top10` JSON → one sentence).
 - Listening journal + streaks + weekly digest to AgainOwner.
 - `/never`, `/anchor`, `/adventurous 0-10` → exploration_slots.
-- Later: Essentia/Librosa audio features + lyrics sentiment as
-  new item features into 2b (no pipeline change needed).
+- Audio ears (done, native — no Essentia/Librosa): `audio/` hears 90s
+  clips with numpy-only DSP (chroma-12 + Krumhansl key/mode, spectral-flux
+  tempo, centroid/rolloff/flatness/ZCR) into `audio_features`; measured
+  BPM/key feed `tempo_fit`, FeatureMF side features, and the final blend.
+  Nightly 02:00 `audio_listen` job, ~150 tracks/night, owner taste first.
+  YouTube watch is bot-walled from datacenter IPs → set `AUDIO_COOKIES`
+  (cookies.txt) to unlock catalog fetches; DSP verified on synthetic +
+  real audio either way.
 
 ---
 

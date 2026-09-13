@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/ venv/
+
+# Parlay-ML runtime (never commit)
+data/store/
+logs/
+models/checkpoints/
+data/*.db
+*.db-shm
+*.db-wal
+
+# Local audio work + secrets
+*.mp3
+*.wav
+cookies*.txt
+*AUDIO_COOKIES*
+.env

@@ -288,13 +288,16 @@ async def _async_main(args: argparse.Namespace) -> int:
     # ── 1. Schema: "Call once at startup to ensure all tables exist." ──
     bootstrap_all()
 
-    # ── 2. Models: load latest checkpoints, or train ──────────────────
+    # ── 2. Models: load latest checkpoints, or train (MAX: one frame, all models) ──
     trainer = TrainingEngine()
     svd = ncf = None
+    max_bundle: dict = {}
 
-    if args.bootstrap or args.train:
-        logger.info("Training at boot (use_synthetic=%s)...", args.bootstrap)
+    if args.bootstrap or args.train or args.light_train or args.deep_train:
+        logger.info("Training at boot (synthetic=%s light=%s deep=%s)...",
+                    args.bootstrap, args.light_train, args.deep_train)
         try:
+            light = bool(args.light_train) and not bool(args.deep_train)
             svd, ncf, metrics = await loop.run_in_executor(
                 None,
                 lambda: trainer.run(
@@ -302,15 +305,30 @@ async def _async_main(args: argparse.Namespace) -> int:
                     n_synthetic_songs=args.synthetic_songs,
                     n_synthetic_users=args.synthetic_users,
                     synthetic_interactions_per_user=args.synthetic_interactions,
+                    light=light,
+                    force_ncf=bool(args.weekly_ncf),
                 ),
             )
+            try:
+                max_bundle = trainer.load_max_bundle()
+            except Exception:
+                max_bundle = {}
         except Exception as e:
             logger.error("Training failed (%s) — aborting.", e, exc_info=True)
             return 1
         logger.info("Training complete → %s", metrics)
     else:
         svd, ncf = trainer.load_latest()
-        if svd is None and ncf is None:
+        try:
+            max_bundle = {"als": getattr(trainer, "als", None),
+                          "feature_mf": getattr(trainer, "feature_mf", None),
+                          "retrievers": getattr(trainer, "retrievers", None),
+                          "sequence": getattr(trainer, "sequence", None),
+                          "two_tower": getattr(trainer, "two_tower", None),
+                          "blender": getattr(trainer, "blender", None)}
+        except Exception:
+            max_bundle = {}
+        if svd is None and ncf is None and not any(max_bundle.values()):
             logger.warning(
                 "No checkpoints in %s — the ensemble will run degraded "
                 "(content + bandit + recency only). Use --bootstrap or --train.",
@@ -320,12 +338,13 @@ async def _async_main(args: argparse.Namespace) -> int:
     version = (
         getattr(svd, "version", None)
         or getattr(ncf, "version", None)
+        or getattr(max_bundle.get("als"), "version", None)
         or "v0"
     )
 
-    # ── 3. Pipeline + content scorer ──────────────────────────────────
-    pipeline = NeuroSyncPipeline(svd_model=svd, ncf_model=ncf)
-    pipeline.set_models(svd, ncf, version=version)
+    # ── 3. Pipeline + content scorer (MAX bundle) ────────────
+    pipeline = NeuroSyncPipeline(svd_model=svd, ncf_model=ncf, max_bundle=max_bundle)
+    pipeline.set_models(svd, ncf, version=version, max_bundle=max_bundle)
     pipeline.fit_tfidf()
 
     # ── 4. Populate the scheduler/jobs.py globals ─────────────────────
@@ -349,8 +368,18 @@ async def _async_main(args: argparse.Namespace) -> int:
 
     # ── --once: one full cycle through the real job functions, then exit ──
     if args.once:
-        logger.info("--once: running a single rec_push cycle.")
-        await jobs.rec_push_job(user_ids)
+        logger.info("--once: running a single rec_push cycle (mood=%r).", getattr(args, "mood", ""))
+        mood = getattr(args, "mood", "") or ""
+        if mood:
+            for uid in user_ids:
+                try:
+                    recs = pipeline.recommend(uid, mood=mood)
+                    if recs:
+                        await push_callback(uid, recs)
+                except Exception as e:
+                    logger.error("once mood push failed for %s: %s", uid, e, exc_info=True)
+        else:
+            await jobs.rec_push_job(user_ids)
         logger.info("--once complete.")
         return 0
 
@@ -404,7 +433,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--train", action="store_true",
-        help="retrain SVD + NCF on accumulated real data at boot, then run.",
+        help="MAX deep-train: ALS + FeatureMF + retrievers + sequence + SVD (+ weekly NCF) on one frame.",
+    )
+    parser.add_argument(
+        "--light-train", action="store_true",
+        help="MAX light-train (:30 hourly): ALS + retrievers + two-tower + sequence only.",
+    )
+    parser.add_argument(
+        "--deep-train", action="store_true",
+        help="Alias for --train (03:00 deep job).",
+    )
+    parser.add_argument(
+        "--weekly-ncf", action="store_true",
+        help="Force torch NCF training even when weekly window has not elapsed.",
+    )
+    parser.add_argument(
+        "--mood", default="", help="Context mood for --once (morning/gym/4am/chill/sad/party/focus).",
     )
     parser.add_argument(
         "--refresh-feed", action="store_true",

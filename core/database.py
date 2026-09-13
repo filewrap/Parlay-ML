@@ -70,6 +70,8 @@ def init_catalog():
             has_official    INTEGER DEFAULT 0,
             has_lyric       INTEGER DEFAULT 0,
             energy_score    REAL DEFAULT 0.5,
+            description     TEXT DEFAULT '',
+            mood_tags       TEXT DEFAULT '',   -- comma-separated free keywords
             first_seen      REAL,   -- unix ts
             last_seen       REAL,
             times_fetched   INTEGER DEFAULT 1,
@@ -78,6 +80,41 @@ def init_catalog():
         CREATE INDEX IF NOT EXISTS idx_songs_genre ON songs(genre_code);
         CREATE INDEX IF NOT EXISTS idx_songs_views ON songs(view_count DESC);
         CREATE INDEX IF NOT EXISTS idx_songs_last_seen ON songs(last_seen DESC);
+        -- MAX: artist co-count graph (artist → song co-counts from descriptions)
+        CREATE TABLE IF NOT EXISTS artist_graph (
+            artist_a        TEXT NOT NULL,
+            artist_b        TEXT NOT NULL,
+            co_count        INTEGER DEFAULT 1,
+            updated_at      REAL,
+            PRIMARY KEY (artist_a, artist_b)
+        );
+        -- MAX: companion prefs (/never blacklist, /anchor, /adventurous)
+        CREATE TABLE IF NOT EXISTS companion_prefs (
+            user_id         INTEGER PRIMARY KEY,
+            blacklist_json  TEXT DEFAULT '[]',
+            anchor_song_id  TEXT DEFAULT '',
+            adventurous     REAL DEFAULT 0.3,
+            updated_at      REAL
+        );
+        -- MAX: listening journal + streaks
+        CREATE TABLE IF NOT EXISTS listening_journal (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            day             TEXT NOT NULL,   -- YYYY-MM-DD
+            plays           INTEGER DEFAULT 0,
+            likes           INTEGER DEFAULT 0,
+            top_genre       INTEGER DEFAULT 20,
+            UNIQUE (user_id, day)
+        );
+        -- MAX: learned blender weights per (user x mood)
+        CREATE TABLE IF NOT EXISTS blender_weights (
+            user_id         INTEGER NOT NULL,
+            mood            TEXT NOT NULL DEFAULT '',
+            weights_json    TEXT NOT NULL,
+            ndcg10          REAL DEFAULT 0,
+            updated_at      REAL,
+            PRIMARY KEY (user_id, mood)
+        );
         """)
 
 
@@ -118,6 +155,7 @@ def init_history():
         );
         CREATE INDEX IF NOT EXISTS idx_listens_user ON listens(user_id, started_at DESC);
         CREATE INDEX IF NOT EXISTS idx_listens_song ON listens(song_id);
+        CREATE INDEX IF NOT EXISTS idx_listens_user_song ON listens(user_id, song_id);
         """)
 
 
@@ -214,7 +252,7 @@ def init_training_log():
             run_id          TEXT PRIMARY KEY,
             started_at      REAL,
             finished_at     REAL,
-            model_type      TEXT,   -- 'svd' | 'ncf'
+            model_type      TEXT,   -- 'svd' | 'ncf' | 'als' | 'feature_mf' | 'all'
             n_samples       INTEGER,
             n_users         INTEGER,
             n_songs         INTEGER,
@@ -224,7 +262,39 @@ def init_training_log():
             model_path      TEXT,
             notes           TEXT
         );
+        -- MAX: split fingerprint + full metric bundle + registry pointers
+        CREATE TABLE IF NOT EXISTS split_fingerprints (
+            run_id          TEXT PRIMARY KEY,
+            cutoff_ts       REAL,
+            leave_last_n    INTEGER,
+            frame_hash      TEXT,
+            n_train         INTEGER,
+            n_valid         INTEGER,
+            created_at      REAL
+        );
+        CREATE TABLE IF NOT EXISTS model_registry (
+            key             TEXT PRIMARY KEY,  -- e.g. 'prod' | 'staging'
+            run_id          TEXT,
+            model_version   TEXT,
+            ndcg10          REAL,
+            updated_at      REAL
+        );
+        CREATE TABLE IF NOT EXISTS model_artifacts (
+            run_id          TEXT,
+            model_name      TEXT,   -- als | feature_mf | retrievers | sequence | svd | ncf | two_tower | blender
+            model_path      TEXT,
+            metrics_json    TEXT,
+            PRIMARY KEY (run_id, model_name)
+        );
         """)
+
+
+def _ensure_column(db_path, table: str, col: str, ddl: str) -> None:
+    """Idempotent ADD COLUMN for existing SQLite files (migration)."""
+    with get_conn(db_path) as conn:
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
 
 def bootstrap_all():
@@ -237,6 +307,17 @@ def bootstrap_all():
     init_bandit()
     init_embeddings()
     init_training_log()
+    # ── MAX migrations for pre-existing DB files ──
+    try:
+        from config import DB_CATALOG as _DBC
+        for _col, _ddl in [
+            ("description", "TEXT DEFAULT ''"),
+            ("mood_tags", "TEXT DEFAULT ''"),
+            ("has_remix", "INTEGER DEFAULT 0"),
+        ]:
+            _ensure_column(_DBC, "songs", _col, _ddl)
+    except Exception:
+        pass
     print("✅  Database schema bootstrapped.")
 
 
