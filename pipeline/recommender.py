@@ -55,6 +55,7 @@ from config import (
     W_SVD, W_NCF, W_CONTENT, W_BANDIT, W_RECENCY,
     LISTEN_HALFLIFE_HOURS, DB_FEED, DB_CATALOG, DB_HISTORY,
     DB_RECS, DB_FEEDBACK, FEEDBACK_DISLIKE_THRESHOLD,
+    HEARD_BOOST, HEARD_WINDOW_DAYS, HEARD_MAX_INJECT,
 )
 from core.database import get_conn
 from models.bandit_content import ThompsonBandit, TFIDFContentScorer
@@ -83,7 +84,7 @@ except Exception:
     MATH_AVAILABLE = False
 
 try:
-    from audio.store import get as _audio_get
+    from audio.store import get as _audio_get, recent_heard as _recent_heard
     AUDIO_AVAILABLE = True
 except Exception:
     AUDIO_AVAILABLE = False
@@ -139,6 +140,38 @@ def _already_played_recently(user_id: int, song_id: str, hours: int = 24) -> boo
             (user_id, song_id, cutoff)
         ).fetchone()
     return row is not None
+
+
+def _heard_candidates(user_id: int, have_ids: set[str]) -> list[dict]:
+    """Fresh-ears injection: recently-heard tracks join the pool.
+
+    Collaborative scores are zero for unlistened tracks, so without this
+    the machine's ears never affect behavior. Injected tracks are marked
+    `_fresh_ears` for the blend boost and the why-line.
+    """
+    if not AUDIO_AVAILABLE:
+        return []
+    try:
+        heard = _recent_heard(since_days=HEARD_WINDOW_DAYS, limit=HEARD_MAX_INJECT * 2)
+    except Exception:
+        return []
+    ids = [h["song_id"] for h in heard
+           if h["song_id"] not in have_ids
+           and not _already_played_recently(int(user_id), h["song_id"])][:HEARD_MAX_INJECT]
+    if not ids:
+        return []
+    placeholders = ",".join(["?"] * len(ids))
+    try:
+        with get_conn(DB_CATALOG) as conn:
+            rows = conn.execute(f"SELECT * FROM songs WHERE song_id IN ({placeholders})", ids).fetchall()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["_fresh_ears"] = True
+        out.append(d)
+    return out
 
 
 # ─── Candidate generation ─────────────────────────────────
@@ -444,6 +477,14 @@ class NeuroSyncPipeline:
         if not candidates:
             return []
 
+        # Fresh ears: inject recently-heard tracks so listening affects
+        # behavior even before any collaborative signal exists.
+        try:
+            _inject = _heard_candidates(int(user_id), {c["song_id"] for c in candidates})
+            candidates = candidates + _inject
+        except Exception as e:
+            logger.warning("Heard inject skipped: %s", e)
+
         song_ids = [c["song_id"] for c in candidates]
         song_meta = {c["song_id"]: c for c in candidates}
 
@@ -501,10 +542,13 @@ class NeuroSyncPipeline:
                 except Exception:
                     math_b, heard = 0.0, False
             final = max(0.0, min(1.0, final + math_b))
+            fresh = bool(meta.get("_fresh_ears"))
+            if fresh:
+                final = max(0.0, min(1.0, final + HEARD_BOOST))
             scored.append((sid, final, {**meta, "_svd": s_svd, "_ncf": s_ncf, "_content": s_content,
                                         "_bandit": s_bandit, "_recency": rec, "_als": s_als,
                                         "_fmf": s_fmf, "_tt": s_tt, "_retr": s_retr, "_seq": s_seq,
-                                        "_math": math_b, "_heard": heard}))
+                                        "_math": math_b, "_heard": heard, "_fresh": fresh}))
         scored.sort(key=lambda x: x[1], reverse=True)
 
         # 4. MMR diversity re-rank (exploration_slots widen diversity).
@@ -568,10 +612,22 @@ class NeuroSyncPipeline:
                                     mr = [f"heard at {float(arow['bpm']):.0f} BPM in {arow.get('musical_key','?')} {arow.get('mode','')}"] + mr
                             except Exception:
                                 pass
+                        if meta.get("_fresh"):
+                            mr = ["fresh ears (the machine just heard this)"] + mr
+                            try:
+                                wdict.setdefault("drivers", []).append("fresh ears")
+                            except Exception:
+                                pass
                         if mr:
                             wdict["math_reasons"] = mr[:2]
                             if wdict.get("why_text"):
                                 wdict["why_text"] += f" Math note: {mr[0]}."
+                    except Exception:
+                        pass
+                if meta.get("_fresh"):
+                    try:
+                        from audio.caption import caption_for as _cap_for
+                        wdict["caption"] = _cap_for(sid, meta.get("title", ""))
                     except Exception:
                         pass
                 results.append({

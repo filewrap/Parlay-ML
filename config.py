@@ -141,6 +141,12 @@ BLENDER_MAX_PER_GENRE = 3
 ANCHOR_SONG_ID   = "owner_mehrama"  # anchor slot for owner (Mehrama-energy)
 ANCHOR_USER_ID   = 6802929470
 
+# ─── Listener addon: fresh ears + emotional arcs ────────
+HEARD_BOOST = 0.06          # extra blend lift for recently-heard tracks
+HEARD_WINDOW_DAYS = 7       # "recently heard" window
+HEARD_MAX_INJECT = 20       # max heard tracks injected into candidate pool
+ARC_WINDOW_S = 10           # emotional-arc window size (seconds)
+
 # ─── Companion (Phase 4) ────────────────────────────────
 MOOD_COMMANDS = ["morning", "gym", "4am", "chill", "sad", "party", "focus"]
 MOOD_GENRE_PREF = {

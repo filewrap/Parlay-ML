@@ -85,6 +85,49 @@ def main() -> None:
     assert heard2 is False and b2 != 0.0, (b2, heard2)
     print("measured bonus ok:", b, "vs guessed:", b2)
 
+    # 8. Emotional arcs: rising swell lifts late; drone stays flat.
+    from audio.features import analyze_arc
+    swell = (_sine(220.0, secs=20.0) * np.linspace(0.05, 1.0, SR * 20)).astype(np.float32)
+    arc = analyze_arc(swell, SR, mode="minor")
+    assert arc["lift"] > 0.15, arc
+    assert arc["climax_frac"] > 0.6, arc
+    flat = analyze_arc(_sine(220.0, secs=20.0), SR, mode="minor")
+    assert flat["lift"] < arc["lift"], (flat["lift"], arc["lift"])
+    print("arc ok: swell lift=%.2f climax=%.2f / flat lift=%.2f"
+          % (arc["lift"], arc["climax_frac"], flat["lift"]))
+
+    # 9. Captioner speaks.
+    from audio.caption import caption
+    s = caption({"bpm": 80.2, "key": "A#", "mode": "minor", "valence": 0.275,
+                 "energy": 0.729, "brightness": 0.263, "harmonic_clarity": 0.377,
+                 "lift": 0.4, "climax_frac": 0.66})
+    assert "A#" in s and "BPM" in s, s
+    print("caption ok:", s)
+
+    # 10. Fresh-ears injection surfaces a heard track.
+    import time as _t
+    from core.database import get_conn
+    from config import DB_CATALOG
+    from audio.store import save as _save_audio
+    from audio.features import summarize as _summ
+    from pipeline.recommender import _heard_candidates
+    with get_conn(DB_CATALOG) as conn:
+        conn.execute("""INSERT INTO songs (song_id,title,channel,duration,view_count,
+            genre_code,language_code,energy_score,yt_url,first_seen,last_seen,times_fetched)
+            VALUES ('_heard_probe','Probe Song','Probe',200,10,6,0,0.5,'',?,?,1)
+            ON CONFLICT(song_id) DO UPDATE SET last_seen=excluded.last_seen""",
+                     (_t.time(), _t.time()))
+    _save_audio("_heard_probe", _summ(dict(
+        __import__("audio.features", fromlist=["analyze"]).analyze(
+            _sine(330.0, secs=12.0), SR))))
+    inj = _heard_candidates(6802929470, {"something_else"})
+    assert any(c["song_id"] == "_heard_probe" for c in inj), [c["song_id"] for c in inj]
+    print("heard inject ok:", [c["song_id"] for c in inj][:5])
+    with get_conn(DB_CATALOG) as conn:
+        conn.execute("DELETE FROM songs WHERE song_id='_heard_probe'")
+        conn.execute("DELETE FROM audio_features WHERE song_id='_heard_probe'")
+        conn.execute("DELETE FROM audio_arcs WHERE song_id='_heard_probe'")
+
     print("ALL AUDIO SELFTESTS PASSED")
 
 

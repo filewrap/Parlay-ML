@@ -126,6 +126,56 @@ def estimate_tempo(mag: np.ndarray, sr: int = 16000) -> tuple[float, float]:
     return round(float(bpm), 1), round(float(np.clip(ac[int(round(lag))], 0, 1)), 3)
 
 
+def analyze_arc(y: np.ndarray, sr: int = 16000, mag: np.ndarray | None = None,
+                window_s: int = 10, mode: str = "major") -> dict:
+    """Emotional journey in `window_s` slices: arousal + valence over time.
+
+    A song isn't one valence number — it's verse at 0.2, lift at 60%,
+    chorus at 0.5. Arousal rides window energy + onset flux; valence
+    rides window brightness around the global mode bias.
+    """
+    y = np.asarray(y, dtype=np.float32)
+    total_s = len(y) / sr
+    win = max(int(window_s * sr), HOP * 4)
+    if mag is None:
+        mag = _stft_mag(y)
+    fps = sr / HOP
+    n_frames = mag.shape[0]
+    # Per-frame brightness + onset flux, pooled per window below.
+    freqs = np.arange(mag.shape[1]) * (sr / FRAME)
+    frame_cent = (mag.astype(np.float64) * freqs).sum(axis=1) / (mag.sum(axis=1) + 1e-12)
+    flux = np.maximum(0.0, np.diff(mag.astype(np.float64), axis=0)).sum(axis=1)
+    flux = np.concatenate([[0.0], flux])
+    frames_per_win = max(int(win / HOP), 1)
+    n_w = max(1, int(round(n_frames / frames_per_win)))
+    arousal, valence = [], []
+    flo, fhi = float(flux.min()), float(flux.max())
+    spread = (fhi - flo) or 1.0
+    # Window energy from the waveform itself (spectral magnitudes are on a
+    # different scale and saturate the hearing curve).
+    samp_per_win = max(int(window_s * sr), 1)
+    for w in range(n_w):
+        lo, hi = w * frames_per_win, min((w + 1) * frames_per_win, n_frames)
+        if hi <= lo:
+            continue
+        s_lo, s_hi = w * samp_per_win, min((w + 1) * samp_per_win, len(y))
+        rms_w = float(np.sqrt(np.mean(y[s_lo:s_hi].astype(np.float64) ** 2))) if s_hi > s_lo else 0.0
+        e_w = float(1.0 - math.exp(-4.0 * rms_w))
+        f_w = float(np.clip((float(flux[lo:hi].mean()) - flo) / spread, 0, 1))
+        b_w = float(np.clip(float(frame_cent[lo:hi].mean()) / 6000.0, 0, 1))
+        arousal.append(round(max(0.0, min(1.0, 0.6 * e_w + 0.4 * f_w)), 3))
+        valence.append(round(max(0.0, min(1.0, 0.45 + (0.15 if mode == "major" else -0.15)
+                                         + 0.25 * (b_w - 0.5) + 0.15 * (e_w - 0.5))), 3))
+    peak_i = int(np.argmax(arousal)) if arousal else 0
+    climax_frac = round((peak_i + 0.5) / max(n_w, 1), 3)
+    lift = round((max(arousal) - min(arousal)) if arousal else 0.0, 3)
+    return {"n": n_w, "window_s": window_s, "duration_s": round(total_s, 1),
+            "arousal": arousal, "valence": valence,
+            "climax_frac": climax_frac, "lift": lift,
+            "start": arousal[0] if arousal else 0.0,
+            "end": arousal[-1] if arousal else 0.0}
+
+
 def spectral_colour(mag: np.ndarray, y: np.ndarray, sr: int = 16000) -> dict:
     """Brightness/energy/noisiness descriptors from spectrum + waveform."""
     mean_spec = mag.mean(axis=0).astype(np.float64) + 1e-12
@@ -151,6 +201,7 @@ def analyze(y: np.ndarray, sr: int = 16000) -> dict:
     mag = _stft_mag(np.asarray(y, dtype=np.float32))
     chroma = _chroma_mean(mag, sr)
     root, mode, key_strength, alt = estimate_key(chroma)
+    arc = analyze_arc(np.asarray(y, dtype=np.float32), sr, mag=mag, mode=mode)
     bpm, tempo_strength = estimate_tempo(mag, sr)
     colour = spectral_colour(mag, np.asarray(y, dtype=np.float32), sr)
     # Soft-saturation energy: mastered music sits ~0.15–0.30 RMS, quiet
@@ -172,6 +223,8 @@ def analyze(y: np.ndarray, sr: int = 16000) -> dict:
         "chroma": [round(float(v), 4) for v in chroma],
         "danceability": danceability, "valence": valence,
         "energy": round(energy, 3), "harmonic_clarity": clarity,
+        "climax_frac": arc["climax_frac"], "lift": arc["lift"],
+        "arc_arousal": arc["arousal"], "arc_valence": arc["valence"],
         **colour,
     }
 
@@ -186,5 +239,9 @@ def summarize(feat: dict) -> dict:
         "harmonic_clarity": feat["harmonic_clarity"],
         "tempo_strength": feat["tempo_strength"],
         "key_strength": feat["key_strength"],
+        "climax_frac": feat.get("climax_frac", 0.5),
+        "lift": feat.get("lift", 0.0),
+        "arc_arousal": ",".join(f"{v:.3f}" for v in feat.get("arc_arousal", [])),
+        "arc_valence": ",".join(f"{v:.3f}" for v in feat.get("arc_valence", [])),
         "chroma": ",".join(f"{v:.3f}" for v in feat["chroma"]),
     }
