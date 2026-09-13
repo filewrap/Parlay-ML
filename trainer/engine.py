@@ -27,6 +27,7 @@ from config import (
     MODELS_DIR, SVD_FACTORS, SVD_EPOCHS, SVD_LR, SVD_REG,
     NCF_EPOCHS, GENRE_MAP, LANGUAGE_MAP, FIB_SEQ,
     REWARD_LIKE, REWARD_DISLIKE, REWARD_FULL_PLAY, REWARD_PARTIAL_PLAY,
+    TRAIN_LOCK_FILE,
 )
 from core.database import get_conn, DB_CATALOG, DB_HISTORY, DB_FEEDBACK, DB_TRAINING
 from models.svd_model import FunkSVD, load_interactions
@@ -270,16 +271,81 @@ class ModelEvaluator:
         }
 
 
-# ─── Training Engine ─────────────────────────────────────────
+# ─── Training Engine (MAX) ─────────────────────────────────
+
+def _peak_rss_mb() -> float:
+    try:
+        import resource
+        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+    except Exception:
+        return 0.0
+
+
+def _acquire_lock() -> bool:
+    try:
+        if TRAIN_LOCK_FILE.exists():
+            age = time.time() - TRAIN_LOCK_FILE.stat().st_mtime
+            if age < 4 * 3600:  # overlapping run guard
+                return False
+        TRAIN_LOCK_FILE.write_text(str(time.time()))
+        return True
+    except Exception:
+        return True
+
+
+def _release_lock() -> None:
+    try:
+        TRAIN_LOCK_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def get_registry(key: str = "prod") -> dict | None:
+    with get_conn(DB_TRAINING) as conn:
+        try:
+            row = conn.execute("SELECT run_id, model_version, ndcg10 FROM model_registry WHERE key=?",
+                               (key,)).fetchone()
+        except Exception:
+            return None
+    return dict(row) if row else None
+
+
+def set_registry(key: str, run_id: str, version: str, ndcg10: float) -> None:
+    with get_conn(DB_TRAINING) as conn:
+        conn.execute("""
+        INSERT INTO model_registry (key, run_id, model_version, ndcg10, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET run_id=excluded.run_id, model_version=excluded.model_version,
+            ndcg10=excluded.ndcg10, updated_at=excluded.updated_at
+        """, (key, run_id, version, float(ndcg10), time.time()))
+
+
+def log_artifact(run_id: str, model_name: str, model_path: str, metrics_json: str = "") -> None:
+    with get_conn(DB_TRAINING) as conn:
+        conn.execute("""
+        INSERT OR REPLACE INTO model_artifacts (run_id, model_name, model_path, metrics_json)
+        VALUES (?, ?, ?, ?)
+        """, (run_id, model_name, str(model_path), metrics_json[:4000]))
+
 
 class TrainingEngine:
     """
-    Orchestrates the full train-eval-save cycle for both models.
+    MAX orchestrator: every model trains on the SAME interaction frame,
+    evals temporally, promotes only on NDCG gain (staging vs prod).
+
+    run() stays back-compat: returns (svd, ncf, metrics).
+    New models are available as attributes after run().
     """
 
     def __init__(self):
         self._svd: Optional[FunkSVD] = None
         self._ncf: Optional[NCFModel] = None
+        self.als = None
+        self.feature_mf = None
+        self.retrievers = None
+        self.sequence = None
+        self.two_tower = None
+        self.blender = None
 
     def run(
         self,
@@ -288,104 +354,273 @@ class TrainingEngine:
         n_synthetic_users: int = 100,
         synthetic_interactions_per_user: int = 200,
         version: Optional[str] = None,
+        light: bool = False,
+        force_ncf: bool = False,
     ) -> tuple:
+        """Full MAX training run.
+
+        light=True  → hourly light-train (ALS + retrievers + two-tower + sequence).
+        light=False → deep-train (all + FeatureMF + SVD + weekly NCF + blender).
         """
-        Full training run. Returns (FunkSVD, NCFModel, metrics).
-        """
+        import json as _json
+        from data.interactions import build_interaction_frame, frame_to_triples
+        from data.split import temporal_split, save_fingerprint
+        from eval.metrics import evaluate_ranker, should_promote
+
         run_id = str(uuid.uuid4())[:8]
         version = version or f"v{int(time.time())}"
         started_at = time.time()
+        if not _acquire_lock():
+            logger.warning("Training lock held — refusing overlap (stagger the VPS).")
+            return self._svd, self._ncf, {"error": "locked", "version": version}
 
-        logger.info(f"══════════════════════════════════════════")
-        logger.info(f"  NeuroSync Training Run [{run_id}]")
-        logger.info(f"  Version: {version}")
-        logger.info(f"══════════════════════════════════════════")
+        logger.info("══════════════════════════════════════════")
+        logger.info("  NeuroSync MAX Training Run [%s] light=%s", run_id, light)
+        logger.info("  Version: %s", version)
+        logger.info("══════════════════════════════════════════")
 
-        # ── 1. Seed synthetic data if needed ──────────────────
-        if use_synthetic:
-            logger.info("Generating synthetic training data...")
-            gen = SyntheticDataGenerator(n_synthetic_users, n_synthetic_songs)
-            songs = gen.generate_songs()
-            interactions = gen.generate_interactions(songs, synthetic_interactions_per_user)
-            gen.seed_db(songs, interactions)
+        try:
+            # ── 1. Seed synthetic if needed ──
+            if use_synthetic:
+                logger.info("Generating synthetic training data...")
+                gen = SyntheticDataGenerator(n_synthetic_users, n_synthetic_songs)
+                songs = gen.generate_songs()
+                interactions = gen.generate_interactions(songs, synthetic_interactions_per_user)
+                gen.seed_db(songs, interactions)
 
-        # ── 2. Load real interactions ──────────────────────────
-        all_interactions = load_interactions()
-        if len(all_interactions) < 20:
-            logger.warning("Very few real interactions — adding synthetic boost.")
-            gen = SyntheticDataGenerator(20, 2000)
-            songs = gen.generate_songs()
-            synt = gen.generate_interactions(songs, 100)
-            gen.seed_db(songs, synt)
-            all_interactions = load_interactions()
+            # ── 2. ONE interaction frame for every model ──
+            frame = build_interaction_frame()
+            if len(frame) < 20:
+                logger.warning("Very few real interactions — adding synthetic boost.")
+                gen = SyntheticDataGenerator(20, 2000)
+                songs = gen.generate_songs()
+                synt = gen.generate_interactions(songs, 100)
+                gen.seed_db(songs, synt)
+                frame = build_interaction_frame()
 
-        # ── 3. Train/Test split (80/20) ───────────────────────
-        np.random.seed(42)
-        np.random.shuffle(all_interactions)
-        split = int(len(all_interactions) * 0.8)
-        train_data = all_interactions[:split]
-        test_data  = all_interactions[split:]
+            train_frame, valid_frame, fp = temporal_split(frame, leave_last_n=5)
+            save_fingerprint(run_id, fp)
+            triples = frame_to_triples(train_frame)
+            n_users = len({d["user_id"] for d in frame})
+            n_songs = len({d["song_id"] for d in frame})
+            logger.info("Frame: %d | train=%d valid=%d | users=%d songs=%d",
+                        len(frame), len(train_frame), len(valid_frame), n_users, n_songs)
 
-        n_users = len(set(u for u, _, _ in all_interactions))
-        n_songs = len(set(s for _, s, _ in all_interactions))
-        logger.info(f"Data: {len(all_interactions)} interactions | {n_users} users | {n_songs} songs")
-        logger.info(f"Train: {len(train_data)} | Test: {len(test_data)}")
+            # ── 3. Train cheap CPU models (always) ──
+            from models.als import ImplicitALS
+            from models.retrievers import RetrieverZoo
+            from models.sequence import SequenceModel
+            from models.two_tower import TwoTower
 
-        # ── 4. Train SVD ──────────────────────────────────────
-        logger.info("\n[1/2] Training FunkSVD...")
-        svd = FunkSVD(version=version)
-        svd_rmse = svd.fit(train_data)
-        svd_path = svd.save()
+            als = ImplicitALS(version=version)
+            als_loss = als.fit(train_frame)
+            als_path = als.save()
 
-        # ── 5. Evaluate SVD ───────────────────────────────────
-        evaluator = ModelEvaluator(svd)
-        metrics = evaluator.evaluate(test_data, k=10)
-        logger.info(f"SVD Metrics: {metrics}")
+            ret = RetrieverZoo(version=version)
+            ret_stats = ret.fit(train_frame)
+            ret_path = ret.save()
 
-        # ── 6. Train NCF ──────────────────────────────────────
-        logger.info("\n[2/2] Training NCF...")
-        ncf = NCFModel(version=version)
-        ncf_loss = ncf.fit(train_data)
-        ncf_path = ncf.save()
+            seq = SequenceModel(version=version)
+            seq_loss = seq.fit(train_frame)
+            seq_path = seq.save()
 
-        # ── 7. Log to DB ──────────────────────────────────────
-        finished_at = time.time()
-        with get_conn(DB_TRAINING) as conn:
-            conn.execute("""
-            INSERT INTO training_runs
-                (run_id, started_at, finished_at, model_type, n_samples,
-                 n_users, n_songs, train_loss, val_loss, rmse, model_path, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                run_id, started_at, finished_at, "svd+ncf",
-                len(train_data), n_users, n_songs,
-                svd_rmse, ncf_loss, metrics.get("rmse", 999.0),
-                str(svd_path),
-                f"metrics={metrics}",
-            ))
+            tt = TwoTower(version=version)
+            tt_loss = tt.fit(train_frame)
+            tt_path = tt.save()
 
-        elapsed = finished_at - started_at
-        logger.info(f"\n✅  Training done in {elapsed:.1f}s")
-        logger.info(f"    SVD RMSE:   {svd_rmse:.4f}")
-        logger.info(f"    NCF Loss:   {ncf_loss:.4f}")
-        logger.info(f"    Eval Metrics: {metrics}")
+            # ── 4. Deep-only: FeatureMF + SVD (+ blender later) ──
+            fmf_loss, fmf_path, svd_rmse, svd_path = 999.0, "", 999.0, ""
+            fmf, svd = None, None
+            if not light:
+                from models.feature_mf import FeatureMF
+                fmf = FeatureMF(version=version)
+                fmf_loss = fmf.fit(train_frame)
+                fmf_path = str(fmf.save())
+                svd = FunkSVD(version=version)
+                svd_rmse = svd.fit(triples)
+                svd_path = str(svd.save())
+                self._svd = svd
+            else:
+                # Light path reuses latest SVD if present.
+                try:
+                    svd, _ = self.load_latest()
+                    self._svd = svd
+                except Exception:
+                    pass
 
-        self._svd = svd
-        self._ncf = ncf
+            # ── 5. NCF: weekly bonus only ──
+            ncf_loss, ncf_path = 999.0, ""
+            ncf = None
+            prod = get_registry("prod")
+            last_weekly = 0.0
+            try:
+                ncf_files = sorted(MODELS_DIR.glob("ncf_*.pkl"), key=lambda p: p.stat().st_mtime)
+                if ncf_files:
+                    last_weekly = ncf_files[-1].stat().st_mtime
+            except Exception:
+                pass
+            weekly_due = (time.time() - last_weekly) > 7 * 86400
+            if force_ncf or (not light and weekly_due):
+                logger.info("NCF weekly training (due=%s)...", weekly_due)
+                ncf = NCFModel(version=version)
+                ncf_loss = ncf.fit(triples)
+                ncf_path = str(ncf.save())
+                self._ncf = ncf
+            else:
+                logger.info("NCF skipped (weekly-only; last=%.1fd ago).", (time.time() - last_weekly) / 86400)
+                try:
+                    _, ncf = self.load_latest()
+                    self._ncf = ncf
+                except Exception:
+                    pass
 
-        return svd, ncf, {**metrics, "version": version, "elapsed_s": round(elapsed, 2)}
+            # ── 6. Temporal eval on ONE harness ──
+            als_for_eval = als
+            fmf_for_eval = fmf
+            tt_for_eval = tt
+
+            def _predict(uid: int, cands: list[str]) -> list[str]:
+                s1 = als_for_eval.predict_batch(uid, cands)
+                s2 = tt_for_eval.predict_batch(uid, cands)
+                s3 = ret.score_candidates(uid, cands)
+                s4 = seq.predict_batch(uid, cands)
+                agg = {s: 0.35 * s1.get(s, 0) + 0.25 * s2.get(s, 0) + 0.25 * s3.get(s, 0) + 0.15 * s4.get(s, 0)
+                       for s in cands}
+                return [s for s, _ in sorted(agg.items(), key=lambda x: x[1], reverse=True)]
+
+            with get_conn(DB_CATALOG) as conn:
+                try:
+                    rows = conn.execute("SELECT song_id, genre_code FROM songs").fetchall()
+                    cat_meta = {r["song_id"]: {"genre_code": r["genre_code"]} for r in rows}
+                except Exception:
+                    cat_meta = {}
+            metrics = evaluate_ranker(_predict, valid_frame, k=10, catalog_meta=cat_meta)
+            ndcg10 = float(metrics.get("ndcg@10", 0.0))
+
+            # ── 7. Blender fit on valid judged pairs (deep only) ──
+            if not light:
+                try:
+                    from ranker.blender import Blender
+                    judged = []
+                    for d in valid_frame[:2000]:
+                        if float(d.get("plan_reward", 0)) <= 0:
+                            continue
+                        uid = int(d["user_id"])
+                        pos, neg = str(d["song_id"]), None
+                        # Sample a negative from train.
+                        for t in train_frame:
+                            if int(t["user_id"]) == uid and str(t["song_id"]) != pos:
+                                neg = str(t["song_id"])
+                                break
+                        if not neg:
+                            continue
+                        cands = [pos, neg]
+                        feats_pos = {"als": als.predict_batch(uid, cands).get(pos, 0),
+                                     "two_tower": tt.predict_batch(uid, cands).get(pos, 0),
+                                     "retriever": ret.score_candidates(uid, cands).get(pos, 0),
+                                     "sequence": seq.predict_batch(uid, cands).get(pos, 0),
+                                     "svd": 0.0, "ncf": 0.0, "feature_mf": 0.0,
+                                     "content": 0.0, "bandit": 0.0, "recency": 0.0,
+                                     "freshness": 0.0, "repeat_pen": 0.0}
+                        feats_neg = {"als": als.predict_batch(uid, cands).get(neg, 0),
+                                     "two_tower": tt.predict_batch(uid, cands).get(neg, 0),
+                                     "retriever": ret.score_candidates(uid, cands).get(neg, 0),
+                                     "sequence": seq.predict_batch(uid, cands).get(neg, 0),
+                                     "svd": 0.0, "ncf": 0.0, "feature_mf": 0.0,
+                                     "content": 0.0, "bandit": 0.0, "recency": 0.0,
+                                     "freshness": 0.0, "repeat_pen": 0.0}
+                        judged.append({"user_id": uid, "pos_scores": feats_pos, "neg_scores": feats_neg})
+                    blender = Blender(version=version)
+                    blender.fit(judged)
+                    self.blender = blender
+                except Exception as e:
+                    logger.warning("Blender fit skipped: %s", e)
+
+            # ── 8. Log + registry (staging vs prod) ──
+            finished_at = time.time()
+            with get_conn(DB_TRAINING) as conn:
+                conn.execute("""
+                INSERT INTO training_runs
+                    (run_id, started_at, finished_at, model_type, n_samples,
+                     n_users, n_songs, train_loss, val_loss, rmse, model_path, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (run_id, started_at, finished_at, "max-all" if not light else "max-light",
+                      len(train_frame), n_users, n_songs, als_loss, tt_loss, svd_rmse,
+                      str(als_path), f"metrics={metrics} rss_mb={_peak_rss_mb():.0f}"))
+            for name, p in (("als", str(als_path)), ("retrievers", str(ret_path)),
+                            ("sequence", str(seq_path)), ("two_tower", str(tt_path)),
+                            ("feature_mf", fmf_path), ("svd", svd_path), ("ncf", ncf_path)):
+                if p:
+                    log_artifact(run_id, name, p, _json.dumps(metrics)[:2000])
+
+            prod_metrics = None
+            if prod:
+                try:
+                    with get_conn(DB_TRAINING) as conn:
+                        row = conn.execute("SELECT metrics_json FROM model_artifacts WHERE run_id=? AND model_name='als'",
+                                           (prod["run_id"],)).fetchone()
+                    prod_metrics = _json.loads(row["metrics_json"]) if row and row["metrics_json"] else None
+                except Exception:
+                    prod_metrics = None
+            from eval.metrics import should_promote as _sp
+            promote, reason = _sp(metrics, prod_metrics)
+            set_registry("staging", run_id, version, ndcg10)
+            if promote:
+                set_registry("prod", run_id, version, ndcg10)
+            logger.info("Eval: %s | promote=%s (%s) | peak RSS=%.0f MB", metrics, promote, reason, _peak_rss_mb())
+
+            self.als, self.retrievers, self.sequence, self.two_tower = als, ret, seq, tt
+            self.feature_mf = fmf
+            elapsed = finished_at - started_at
+            full_metrics = {**metrics, "version": version, "elapsed_s": round(elapsed, 2),
+                            "als_loss": round(float(als_loss), 4), "promoted": promote}
+            return self._svd, self._ncf, full_metrics
+        finally:
+            _release_lock()
 
     def load_latest(self) -> tuple:
-        """Load the most recently saved model pair."""
-        svd_files = sorted(MODELS_DIR.glob("svd_*.pkl"), key=lambda p: p.stat().st_mtime)
-        ncf_files = sorted(MODELS_DIR.glob("ncf_*.pkl"), key=lambda p: p.stat().st_mtime)
+        """Load the most recently saved model pair (plus MAX models as attrs)."""
+        from models.als import ImplicitALS
+        from models.retrievers import RetrieverZoo
+        from models.sequence import SequenceModel
+        from models.two_tower import TwoTower
+        from models.feature_mf import FeatureMF
 
-        svd = FunkSVD.load(svd_files[-1]) if svd_files else None
-        ncf = NCFModel.load(ncf_files[-1]) if ncf_files else None
+        def _latest(pat: str):
+            files = sorted(MODELS_DIR.glob(pat), key=lambda p: p.stat().st_mtime)
+            return files[-1] if files else None
 
-        if svd:
-            logger.info(f"Loaded SVD: {svd_files[-1].name}")
-        if ncf:
-            logger.info(f"Loaded NCF: {ncf_files[-1].name}")
-
+        svd = FunkSVD.load(_latest("svd_*.pkl")) if _latest("svd_*.pkl") else None
+        ncf = None
+        try:
+            ncf = NCFModel.load(_latest("ncf_*.pkl")) if _latest("ncf_*.pkl") else None
+        except Exception as e:
+            logger.warning("NCF load skipped: %s", e)
+        for attr, pat, cls in (("als", "als_*.pkl", ImplicitALS),
+                               ("retrievers", "retrievers_*.pkl", RetrieverZoo),
+                               ("sequence", "sequence_*.pkl", SequenceModel),
+                               ("two_tower", "two_tower_*.pkl", TwoTower),
+                               ("feature_mf", "feature_mf_*.pkl", FeatureMF)):
+            try:
+                p = _latest(pat)
+                setattr(self, attr, cls.load(p) if p else None)
+                if p:
+                    logger.info("Loaded %s: %s", attr, p.name)
+            except Exception as e:
+                logger.warning("Load %s skipped: %s", attr, e)
+                setattr(self, attr, None)
+        self._svd, self._ncf = svd, ncf
+        try:
+            from ranker.blender import Blender
+            self.blender = Blender()
+        except Exception:
+            self.blender = None
         return svd, ncf
+
+    def load_max_bundle(self) -> dict:
+        """Convenience: load everything, return name → model dict."""
+        self.load_latest()
+        return {"svd": self._svd, "ncf": self._ncf, "als": self.als,
+                "feature_mf": self.feature_mf, "retrievers": self.retrievers,
+                "sequence": self.sequence, "two_tower": self.two_tower,
+                "blender": self.blender}

@@ -48,14 +48,33 @@ YT_SEARCH_QUERIES = [
     "R&B trending",
     "indie music popular",
 ]
+# ─── MAX: deep-scrape expansion (Phase 1) ───────────────
+# Per-artist discographies + per-mood + charts + related expansion.
+YT_DEEP_ARTISTS = [
+    "Anuv Jain", "Talha Anjum", "Prateek Kuhad", "Seema Mishra",
+]
+YT_DEEP_MOODS = [
+    "sad lofi night", "chill morning acoustic", "gym workout hits",
+    "4am vibes playlist", "romantic hindi songs", "punjabi rap hits",
+]
+YT_DEEP_CHARTS = [
+    "billboard hot 100 this week", "spotify top 50 global",
+    "top hindi songs this week", "coke studio pakistan",
+]
+YT_RELATED_TEMPLATES = [
+    "songs like {seed}", "{artist} similar artists", "{seed} mix",
+]
 YT_FEED_TOP_N     = 100      # songs kept from hourly feed
-YT_FETCH_WORKERS  = 8        # concurrent yt-dlp workers
+YT_DEEP_TOP_N     = 2500     # songs kept from nightly deep feed (2-5k target)
+YT_FETCH_WORKERS  = 5        # MAX: 4-6 concurrent workers (was 8, OOM guard)
 YT_MIN_VIEWS      = 10_000   # filter garbage
 YT_MAX_DURATION   = 600      # max 10 min songs
+FEED_SNAPSHOT_RETENTION_DAYS = 7  # keep 7 days of feed_songs, vacuum weekly
 
 # ─── Recommendation pipeline ─────────────────────────────
 REC_TOP_K          = 10      # final recommendations sent to user
-REC_CANDIDATE_POOL = 500     # pool fed into ranking
+REC_CANDIDATE_POOL = 2000    # pool fed into ranking (MAX: 5+ retrievers → ~2000)
+REC_PRECOMPUTE_TOP_N = 200   # nightly precompute per user (Phase 3)
 FEEDBACK_DISLIKE_THRESHOLD = 5   # auto-disable after 5 dislikes
 
 # ─── ML / Model hyperparams ──────────────────────────────
@@ -89,6 +108,52 @@ BLOOM_HASH_COUNT  = 7
 # ─── Time-decay (half-life) ───────────────────────────────
 LISTEN_HALFLIFE_HOURS = 168   # 1 week half-life for old listens
 FEED_HALFLIFE_HOURS   = 24    # 24h for feed freshness
+INTERACTION_HALFLIFE_DAYS = 30  # MAX Phase 0: confidence time-decay at train time
+
+# ─── MAX implicit-confidence worldview (Phase 0) ────────
+# confidence c = 1 + alpha * reward ; preference p = 1 if reward > 0 else 0
+IMPLICIT_ALPHA = 2.0
+# Plan-native reward shaping (plays are implicit feedback):
+# full-play=3, like=5, partial=1, skip-fast=-2, dislike=-5
+PLAN_REWARD_FULL_PLAY    = 3.0
+PLAN_REWARD_LIKE         = 5.0
+PLAN_REWARD_PARTIAL_PLAY = 1.0
+PLAN_REWARD_SKIP_FAST    = -2.0
+PLAN_REWARD_DISLIKE      = -5.0
+NEGATIVES_PER_POSITIVE = 4  # 50% uniform, 50% popularity-biased
+
+# ─── MAX model hyperparams (Phase 2) ────────────────────
+ALS_FACTORS    = 128
+ALS_ITERATIONS = 18
+ALS_REG        = 0.08
+ALS_ALPHA      = 2.0   # confidence scale (same worldview as IMPLICIT_ALPHA)
+FEATURE_MF_FACTORS = 64
+FEATURE_MF_EPOCHS  = 25
+FEATURE_MF_LR      = 0.05
+TWO_TOWER_DIM  = 64
+SEQ_MAX_LEN    = 20    # last-20 listens for sequence continuity
+
+# ─── MAX blender (Phase 3) ──────────────────────────────
+BLENDER_LR       = 0.1
+BLENDER_EPOCHS   = 200
+BLENDER_L2       = 1e-4
+BLENDER_MAX_PER_GENRE = 3
+ANCHOR_SONG_ID   = "owner_mehrama"  # anchor slot for owner (Mehrama-energy)
+ANCHOR_USER_ID   = 6802929470
+
+# ─── Companion (Phase 4) ────────────────────────────────
+MOOD_COMMANDS = ["morning", "gym", "4am", "chill", "sad", "party", "focus"]
+MOOD_GENRE_PREF = {
+    "morning": [6, 3, 9], "gym": [4, 2, 16], "4am": [0, 6, 18],
+    "chill": [0, 6, 9], "sad": [6, 18, 5], "party": [3, 4, 12], "focus": [0, 10, 9],
+}
+
+# ─── Resource budget (8 GB, no GPU) ─────────────────────
+MAX_TRAIN_WORKERS = 5
+TRAIN_LOCK_FILE = DATA_DIR / "train.lock"
+PRECOMPUTE_DIR = DATA_DIR / "precompute"
+for _d in [PRECOMPUTE_DIR]:
+    _d.mkdir(parents=True, exist_ok=True)
 
 # ─── Scheduler intervals (seconds) ───────────────────────
 FEED_REFRESH_INTERVAL  = 3600       # every hour

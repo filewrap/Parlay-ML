@@ -32,6 +32,8 @@ from config import (
     YT_SEARCH_QUERIES, YT_FEED_TOP_N, YT_FETCH_WORKERS,
     YT_MIN_VIEWS, YT_MAX_DURATION, FEED_HALFLIFE_HOURS,
     FIB_SEQ, GENRE_MAP, LANGUAGE_MAP,
+    YT_DEEP_ARTISTS, YT_DEEP_MOODS, YT_DEEP_CHARTS, YT_RELATED_TEMPLATES,
+    YT_DEEP_TOP_N, FEED_SNAPSHOT_RETENTION_DAYS,
 )
 from core.database import get_conn, DB_FEED, DB_CATALOG
 from core.bloom import is_duplicate, mark_seen
@@ -100,11 +102,29 @@ def _extract_via_ytdlp(query: str, max_results: int = 50) -> list[dict]:
 
 
 def _detect_genre(title: str, description: str = "") -> int:
+    # Word-boundary matching avoids substring collisions
+    # ("trap" in "trap nation" ok, but "pop" in "popular" must not win).
     text = (title + " " + description).lower()
-    for keyword, code in GENRE_MAP.items():
-        if keyword in text:
-            return code
+    # Check multi-word / distinctive keys first, longest first.
+    for keyword in sorted(GENRE_MAP.keys(), key=len, reverse=True):
+        if keyword == "unknown":
+            continue
+        if re.search(r"\b" + re.escape(keyword) + r"\b", text):
+            return GENRE_MAP[keyword]
     return GENRE_MAP["unknown"]
+
+
+MOOD_KEYWORDS = {
+    "sad", "chill", "night", "morning", "gym", "workout", "romantic",
+    "lofi", "acoustic", "vibes", "4am", "soulful", "heartbreak", "folk",
+    "bhajan", "party", "focus", "love",
+}
+
+
+def _extract_mood_tags(title: str, description: str = "") -> str:
+    text = (title + " " + description).lower()
+    hits = sorted({w for w in MOOD_KEYWORDS if re.search(r"\b" + re.escape(w) + r"\b", text)})
+    return ",".join(hits[:8])
 
 
 def _detect_language(title: str) -> int:
@@ -201,6 +221,7 @@ def parse_info(info: dict) -> Optional[dict]:
     has_official = int(any(t in title_lower for t in OFFICIAL_TAGS))
     has_lyric = int(any(t in title_lower for t in LYRIC_TAGS))
     has_remix = int(any(t in title_lower for t in REMIX_TAGS))
+    desc = info.get("description") or ""
 
     return {
         "song_id":       song_id,
@@ -213,12 +234,14 @@ def parse_info(info: dict) -> Optional[dict]:
         "upload_date":   info.get("upload_date") or "",
         "thumbnail_url": info.get("thumbnail") or "",
         "yt_url":        f"https://youtube.com/watch?v={song_id}",
-        "genre_code":    _detect_genre(title, info.get("description") or ""),
+        "genre_code":    _detect_genre(title, desc),
         "language_code": _detect_language(title),
         "has_official":  has_official,
         "has_lyric":     has_lyric,
         "has_remix":     has_remix,
         "energy_score":  _energy_score(title),
+        "description":   desc[:2000],
+        "mood_tags":     _extract_mood_tags(title, desc),
         "raw_score":     _raw_score(info),
         "first_seen":    time.time(),
         "last_seen":     time.time(),
@@ -305,20 +328,111 @@ async def _save_feed_snapshot(songs: list[dict]) -> str:
                 INSERT INTO songs (
                     song_id, title, channel, channel_id, duration, view_count,
                     like_count, upload_date, thumbnail_url, yt_url, genre_code,
-                    language_code, has_official, has_lyric, energy_score,
+                    language_code, has_official, has_lyric, has_remix, energy_score,
+                    description, mood_tags,
                     first_seen, last_seen, times_fetched
                 ) VALUES (
                     :song_id, :title, :channel, :channel_id, :duration, :view_count,
                     :like_count, :upload_date, :thumbnail_url, :yt_url, :genre_code,
-                    :language_code, :has_official, :has_lyric, :energy_score,
+                    :language_code, :has_official, :has_lyric, :has_remix, :energy_score,
+                    :description, :mood_tags,
                     :first_seen, :last_seen, 1
                 ) ON CONFLICT(song_id) DO UPDATE SET
                     view_count   = MAX(excluded.view_count, view_count),
                     like_count   = MAX(excluded.like_count, like_count),
                     last_seen    = excluded.last_seen,
+                    description  = excluded.description,
+                    mood_tags    = excluded.mood_tags,
                     times_fetched= times_fetched + 1
-                """, s)
+                """, {k: s.get(k) for k in (
+                    "song_id", "title", "channel", "channel_id", "duration", "view_count",
+                    "like_count", "upload_date", "thumbnail_url", "yt_url", "genre_code",
+                    "language_code", "has_official", "has_lyric", "has_remix", "energy_score",
+                    "description", "mood_tags", "first_seen", "last_seen")})
                 mark_seen(s["song_id"])
+            # Artist graph: artist → song co-counts (free from channel names).
+            try:
+                chans = [s.get("channel", "") for s in songs if s.get("channel")]
+                for i in range(min(len(chans), 60)):
+                    for j in range(i + 1, min(len(chans), 60)):
+                        a, b = sorted([chans[i][:48], chans[j][:48]])
+                        if a and b and a != b:
+                            conn.execute("""
+                            INSERT INTO artist_graph (artist_a, artist_b, co_count, updated_at)
+                            VALUES (?, ?, 1, ?)
+                            ON CONFLICT(artist_a, artist_b) DO UPDATE SET
+                                co_count = co_count + 1, updated_at = excluded.updated_at
+                            """, (a, b, now))
+            except Exception as e:
+                logger.warning("artist_graph update skipped: %s", e)
 
     await loop.run_in_executor(None, _db_save)
     logger.info(f"✅  Feed snapshot saved ({len(songs)} songs).")
+
+
+# ─── MAX Phase 1: nightly deep scrape (2–5k) ────────────
+
+def deep_queries(seed_catalog_titles: list[str] | None = None) -> list[str]:
+    """Build deep query list: discographies + moods + charts + related expansion."""
+    qs: list[str] = []
+    for artist in YT_DEEP_ARTISTS:
+        qs.append(f"{artist} discography full songs")
+        qs.append(f"{artist} best songs")
+    qs.extend(YT_DEEP_MOODS)
+    qs.extend(YT_DEEP_CHARTS)
+    for seed in (seed_catalog_titles or [])[:10]:
+        for tmpl in YT_RELATED_TEMPLATES:
+            try:
+                qs.append(tmpl.format(seed=seed, artist=seed))
+            except Exception:
+                pass
+    # De-dup preserving order.
+    return list(dict.fromkeys(qs))
+
+
+async def scrape_deep_feed(seed_catalog_titles: list[str] | None = None) -> list[dict]:
+    """Nightly deep job: per-artist / per-mood / charts / related expansion.
+
+    Same workers (4–6) and bloom dedup; keeps YT_DEEP_TOP_N by raw_score.
+    Target ~2–5k/night; hourly job never OOMs because this runs at 03:00
+    under the scheduler lock (never scrape + train at once).
+    """
+    queries = deep_queries(seed_catalog_titles)
+    logger.info("🌙 Deep scrape: %d queries (workers=%d)...", len(queries), YT_FETCH_WORKERS)
+    sem = asyncio.Semaphore(YT_FETCH_WORKERS)
+    all_results: list[dict] = []
+    tasks = [_scrape_query(q, sem, all_results) for q in queries]
+    await asyncio.gather(*tasks)
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for song in all_results:
+        sid = song["song_id"]
+        if sid not in seen and not is_duplicate(sid):
+            seen.add(sid)
+            unique.append(song)
+    unique.sort(key=lambda x: x["raw_score"], reverse=True)
+    top = unique[:YT_DEEP_TOP_N]
+    logger.info("  Deep: %d raw → %d unique → keeping %d", len(all_results), len(unique), len(top))
+    await _save_feed_snapshot(top)
+    prune_old_feed_snapshots()
+    return top
+
+
+def prune_old_feed_snapshots(retention_days: int = FEED_SNAPSHOT_RETENTION_DAYS) -> int:
+    """Snapshot retention: 7 days of feed_songs, vacuum catalog weekly."""
+    cutoff = time.time() - retention_days * 86400
+    purged = 0
+    with get_conn(DB_FEED) as conn:
+        try:
+            rows = conn.execute("SELECT snapshot_id FROM feed_snapshots WHERE fetched_at < ?",
+                                (cutoff,)).fetchall()
+            ids = [r["snapshot_id"] for r in rows]
+            if ids:
+                ph = ",".join(["?"] * len(ids))
+                conn.execute(f"DELETE FROM feed_songs WHERE snapshot_id IN ({ph})", ids)
+                conn.execute(f"DELETE FROM feed_snapshots WHERE snapshot_id IN ({ph})", ids)
+                purged = len(ids)
+        except Exception as e:
+            logger.warning("prune feed snapshots failed: %s", e)
+    logger.info("  Feed retention: purged %d snapshots older than %dd.", purged, retention_days)
+    return purged
