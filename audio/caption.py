@@ -57,7 +57,27 @@ def caption(feat: dict) -> str:
     arc = _arc_word(float(feat.get("lift", 0.0) or 0.0),
                     float(feat.get("climax_frac", 0.5) or 0.5))
     bpm_bit = f" (~{bpm:.0f} BPM)" if bpm > 0 else ""
-    return f"{head}{bpm_bit}, {tex}. It {arc}."
+    out = f"{head}{bpm_bit}, {tex}. It {arc}."
+    try:
+        vp = float(feat.get("voice_pct", 0) or 0)
+    except Exception:
+        vp = 0.0
+    if vp > 0.05:
+        enter = feat.get("voice_enter_s", -1)
+        try:
+            enter = float(enter)
+        except Exception:
+            enter = -1
+        when = f"enters ~{enter:.0f}s" if enter and enter >= 0 else "enters early"
+        reg = str(feat.get("register", "") or "")
+        peak = feat.get("peak_f0", 0)
+        try:
+            peak = float(peak)
+        except Exception:
+            peak = 0
+        cry = f", cries to {peak:.0f} Hz at the peak" if peak > 0 else ""
+        out += f" The voice {when}, {reg or 'quiet'} register{cry}."
+    return out
 
 
 def caption_for(song_id: str, title: str = "") -> str:

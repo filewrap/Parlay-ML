@@ -418,7 +418,8 @@ async def scrape_deep_feed(seed_catalog_titles: list[str] | None = None) -> list
     return top
 
 
-def prune_old_feed_snapshots(retention_days: int = FEED_SNAPSHOT_RETENTION_DAYS) -> int:
+def prune_old_feed_snapshots(retention_days: int = FEED_SNAPSHOT_RETENTION_DAYS,
+                               dry_run: bool = False) -> int:
     """Snapshot retention: 7 days of feed_songs, vacuum catalog weekly."""
     cutoff = time.time() - retention_days * 86400
     purged = 0
@@ -427,12 +428,15 @@ def prune_old_feed_snapshots(retention_days: int = FEED_SNAPSHOT_RETENTION_DAYS)
             rows = conn.execute("SELECT snapshot_id FROM feed_snapshots WHERE fetched_at < ?",
                                 (cutoff,)).fetchall()
             ids = [r["snapshot_id"] for r in rows]
-            if ids:
+            if ids and dry_run:
+                purged = len(ids)
+            elif ids:
                 ph = ",".join(["?"] * len(ids))
                 conn.execute(f"DELETE FROM feed_songs WHERE snapshot_id IN ({ph})", ids)
                 conn.execute(f"DELETE FROM feed_snapshots WHERE snapshot_id IN ({ph})", ids)
                 purged = len(ids)
         except Exception as e:
             logger.warning("prune feed snapshots failed: %s", e)
-    logger.info("  Feed retention: purged %d snapshots older than %dd.", purged, retention_days)
+    logger.info("  Feed retention: %s %d snapshots older than %dd.",
+                "would purge" if dry_run else "purged", purged, retention_days)
     return purged

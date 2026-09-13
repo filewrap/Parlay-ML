@@ -35,7 +35,17 @@ CREATE TABLE IF NOT EXISTS audio_arcs (
     valence     TEXT DEFAULT '',
     climax_frac REAL DEFAULT 0.5,
     lift        REAL DEFAULT 0,
+    melody_10s  TEXT DEFAULT '',
+    presence_10s TEXT DEFAULT '',
     analyzed_at REAL
+);
+-- Words: synced lyrics cache (lrclib, free, no key).
+CREATE TABLE IF NOT EXISTS track_lyrics (
+    song_id     TEXT PRIMARY KEY,
+    plain       TEXT DEFAULT '',
+    synced_json TEXT DEFAULT '',
+    source      TEXT DEFAULT '',
+    fetched_at  REAL
 );
 -- Fetch backoff: don't hammer blocked videos every night.
 CREATE TABLE IF NOT EXISTS audio_fetch_state (
@@ -55,9 +65,28 @@ def ensure_schema() -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(audio_features)").fetchall()]
         for col, ddl in (("key_alt", "TEXT DEFAULT ''"),
                          ("climax_frac", "REAL DEFAULT 0.5"),
-                         ("lift", "REAL DEFAULT 0")):
+                         ("lift", "REAL DEFAULT 0"),
+                         ("source", "TEXT DEFAULT ''"),
+                         ("clip_secs", "REAL DEFAULT 0"),
+                         ("voice_pct", "REAL DEFAULT 0"),
+                         ("vibrato_pct", "REAL DEFAULT 0"),
+                         ("median_f0", "REAL DEFAULT 0"),
+                         ("f0_lo", "REAL DEFAULT 0"),
+                         ("f0_hi", "REAL DEFAULT 0"),
+                         ("peak_f0", "REAL DEFAULT 0"),
+                         ("register", "TEXT DEFAULT ''"),
+                         ("voice_enter_s", "REAL DEFAULT -1")):
             if col not in cols:
                 conn.execute(f"ALTER TABLE audio_features ADD COLUMN {col} {ddl}")
+        acols = [r[1] for r in conn.execute("PRAGMA table_info(audio_arcs)").fetchall()]
+        for col, ddl in (("melody_10s", "TEXT DEFAULT ''"), ("presence_10s", "TEXT DEFAULT ''")):
+            if col not in acols:
+                conn.execute(f"ALTER TABLE audio_arcs ADD COLUMN {col} {ddl}")
+
+
+def _enter(summary: dict) -> float:
+    v = summary.get("voice_enter_s", -1)
+    return float(v) if v is not None else -1.0
 
 
 def save(song_id: str, summary: dict) -> None:
@@ -67,8 +96,10 @@ def save(song_id: str, summary: dict) -> None:
         INSERT INTO audio_features
             (song_id, bpm, musical_key, mode, key_alt, danceability, valence, energy,
              brightness, harmonic_clarity, tempo_strength, key_strength,
-             climax_frac, lift, chroma, analyzed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             climax_frac, lift, chroma, source, clip_secs,
+             voice_pct, vibrato_pct, median_f0, f0_lo, f0_hi, peak_f0, register,
+             voice_enter_s, analyzed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(song_id) DO UPDATE SET
             bpm=excluded.bpm, musical_key=excluded.musical_key, mode=excluded.mode,
             key_alt=excluded.key_alt,
@@ -77,7 +108,12 @@ def save(song_id: str, summary: dict) -> None:
             harmonic_clarity=excluded.harmonic_clarity,
             tempo_strength=excluded.tempo_strength, key_strength=excluded.key_strength,
             climax_frac=excluded.climax_frac, lift=excluded.lift,
-            chroma=excluded.chroma, analyzed_at=excluded.analyzed_at
+            chroma=excluded.chroma, source=excluded.source,
+            clip_secs=excluded.clip_secs,
+            voice_pct=excluded.voice_pct, vibrato_pct=excluded.vibrato_pct,
+            median_f0=excluded.median_f0, f0_lo=excluded.f0_lo, f0_hi=excluded.f0_hi,
+            peak_f0=excluded.peak_f0, register=excluded.register,
+            voice_enter_s=excluded.voice_enter_s, analyzed_at=excluded.analyzed_at
         """, (str(song_id), float(summary.get("bpm", 0)), str(summary.get("key", "")),
               str(summary.get("mode", "")), str(summary.get("key_alt", "")),
               float(summary.get("danceability", 0.5)),
@@ -85,13 +121,41 @@ def save(song_id: str, summary: dict) -> None:
               float(summary.get("brightness", 0.5)), float(summary.get("harmonic_clarity", 0.5)),
               float(summary.get("tempo_strength", 0)), float(summary.get("key_strength", 0)),
               float(summary.get("climax_frac", 0.5)), float(summary.get("lift", 0)),
-              str(summary.get("chroma", "")), time.time()))
-    # Full arc series lives beside it.
+              str(summary.get("chroma", "")), str(summary.get("source", "")),
+              float(summary.get("clip_secs", 0)),
+              float(summary.get("voice_pct", 0)), float(summary.get("vibrato_pct", 0)),
+              float(summary.get("median_f0", 0)), float(summary.get("f0_lo", 0)),
+              float(summary.get("f0_hi", 0)), float(summary.get("peak_f0", 0)),
+              str(summary.get("register", "")), _enter(summary),
+              time.time()))
+    # Full arc + melody series live beside it.
     try:
         save_arc(str(song_id), {"arousal": str(summary.get("arc_arousal", "")),
                                 "valence": str(summary.get("arc_valence", "")),
                                 "climax_frac": float(summary.get("climax_frac", 0.5)),
-                                "lift": float(summary.get("lift", 0))})
+                                "lift": float(summary.get("lift", 0)),
+                                "melody_10s": str(summary.get("melody_10s", "")),
+                                "presence_10s": str(summary.get("presence_10s", ""))})
+    except Exception:
+        pass
+    # The Gate hears about every hearing: append to the listen ledger.
+    try:
+        from gate.state import record_listen
+        title = ""
+        try:
+            with get_conn(DB_CATALOG) as conn:
+                row = conn.execute("SELECT title FROM songs WHERE song_id=?",
+                                   (str(song_id),)).fetchone()
+            title = row["title"] if row else ""
+        except Exception:
+            pass
+        cap = ""
+        try:
+            from audio.caption import caption as _cap
+            cap = _cap({**summary, "musical_key": summary.get("key", "")})
+        except Exception:
+            pass
+        record_listen(str(song_id), title, summary, cap)
     except Exception:
         pass
 
@@ -102,21 +166,24 @@ def get(song_id: str) -> dict | None:
         row = conn.execute("SELECT * FROM audio_features WHERE song_id=?", (str(song_id),)).fetchone()
     return dict(row) if row else None
 
-
 def save_arc(song_id: str, arc: dict) -> None:
     ensure_schema()
     arousal = arc.get("arousal", "")
     n = len([v for v in str(arousal).split(",") if v.strip()])
     with get_conn(DB_CATALOG) as conn:
         conn.execute("""
-        INSERT INTO audio_arcs (song_id, n_windows, arousal, valence, climax_frac, lift, analyzed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO audio_arcs (song_id, n_windows, arousal, valence, climax_frac, lift,
+                                melody_10s, presence_10s, analyzed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(song_id) DO UPDATE SET
             n_windows=excluded.n_windows, arousal=excluded.arousal,
             valence=excluded.valence, climax_frac=excluded.climax_frac,
-            lift=excluded.lift, analyzed_at=excluded.analyzed_at
+            lift=excluded.lift, melody_10s=excluded.melody_10s,
+            presence_10s=excluded.presence_10s, analyzed_at=excluded.analyzed_at
         """, (str(song_id), n, str(arousal), str(arc.get("valence", "")),
-              float(arc.get("climax_frac", 0.5)), float(arc.get("lift", 0)), time.time()))
+              float(arc.get("climax_frac", 0.5)), float(arc.get("lift", 0)),
+              str(arc.get("melody_10s", "")), str(arc.get("presence_10s", "")),
+              time.time()))
 
 
 def get_arc(song_id: str) -> dict | None:
@@ -124,6 +191,36 @@ def get_arc(song_id: str) -> dict | None:
     with get_conn(DB_CATALOG) as conn:
         row = conn.execute("SELECT * FROM audio_arcs WHERE song_id=?", (str(song_id),)).fetchone()
     return dict(row) if row else None
+
+
+def save_lyrics(song_id: str, lyrics: dict) -> None:
+    import json as _json
+    ensure_schema()
+    with get_conn(DB_CATALOG) as conn:
+        conn.execute("""
+        INSERT INTO track_lyrics (song_id, plain, synced_json, source, fetched_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(song_id) DO UPDATE SET plain=excluded.plain,
+            synced_json=excluded.synced_json, source=excluded.source,
+            fetched_at=excluded.fetched_at
+        """, (str(song_id), str(lyrics.get("plain", "")),
+              _json.dumps(lyrics.get("synced", []))[:20000],
+              str(lyrics.get("source", "")), time.time()))
+
+
+def get_lyrics(song_id: str) -> dict | None:
+    import json as _json
+    ensure_schema()
+    with get_conn(DB_CATALOG) as conn:
+        row = conn.execute("SELECT * FROM track_lyrics WHERE song_id=?", (str(song_id),)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["synced"] = _json.loads(d.get("synced_json") or "[]")
+    except Exception:
+        d["synced"] = []
+    return d
 
 
 def recent_heard(since_days: float = 7.0, limit: int = 20) -> list[dict]:

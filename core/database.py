@@ -286,6 +286,16 @@ def init_training_log():
             metrics_json    TEXT,
             PRIMARY KEY (run_id, model_name)
         );
+        -- OPS: every promotion remembered (rollback needs history, not just pointers)
+        CREATE TABLE IF NOT EXISTS registry_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            key             TEXT NOT NULL,   -- 'prod' | 'staging'
+            run_id          TEXT,
+            model_version   TEXT,
+            ndcg10          REAL,
+            updated_at      REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reg_hist ON registry_history(key, updated_at DESC);
         """)
 
 

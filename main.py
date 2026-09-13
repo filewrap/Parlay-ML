@@ -288,14 +288,30 @@ async def _async_main(args: argparse.Namespace) -> int:
     # ── 1. Schema: "Call once at startup to ensure all tables exist." ──
     bootstrap_all()
 
+    # ── 0. Operator commands (no daemon): --status/--rollback/--clean-dry-run ──
+    if getattr(args, "status", False):
+        import json as _json
+        from ops.status import status as _ops_status
+        print(_json.dumps(_ops_status(), indent=2, default=str))
+        return 0
+    if getattr(args, "rollback", False):
+        import json as _json
+        from trainer.engine import rollback_prod
+        print(_json.dumps(rollback_prod(), indent=2, default=str))
+        return 0
+    if getattr(args, "clean_dry_run", False):
+        n = await jobs.catalog_clean_job(dry_run=True)
+        print(f"DRY RUN: would remove ~{n} catalog rows + old snapshots. Nothing changed.")
+        return 0
+
     # ── 2. Models: load latest checkpoints, or train (MAX: one frame, all models) ──
     trainer = TrainingEngine()
     svd = ncf = None
     max_bundle: dict = {}
 
-    if args.bootstrap or args.train or args.light_train or args.deep_train:
-        logger.info("Training at boot (synthetic=%s light=%s deep=%s)...",
-                    args.bootstrap, args.light_train, args.deep_train)
+    if args.bootstrap or args.train or args.light_train or args.deep_train or args.smoke:
+        logger.info("Training at boot (synthetic=%s light=%s deep=%s smoke=%s)...",
+                    args.bootstrap, args.light_train, args.deep_train, args.smoke)
         try:
             light = bool(args.light_train) and not bool(args.deep_train)
             svd, ncf, metrics = await loop.run_in_executor(
@@ -307,16 +323,21 @@ async def _async_main(args: argparse.Namespace) -> int:
                     synthetic_interactions_per_user=args.synthetic_interactions,
                     light=light,
                     force_ncf=bool(args.weekly_ncf),
+                    smoke=bool(args.smoke),
                 ),
             )
             try:
-                max_bundle = trainer.load_max_bundle()
+                max_bundle = {} if args.smoke else trainer.load_max_bundle()
             except Exception:
                 max_bundle = {}
         except Exception as e:
             logger.error("Training failed (%s) — aborting.", e, exc_info=True)
             return 1
         logger.info("Training complete → %s", metrics)
+        if args.smoke:
+            import json as _json
+            print("SMOKE:", _json.dumps(metrics, indent=2, default=str))
+            return 0
     else:
         svd, ncf = trainer.load_latest()
         try:
@@ -392,6 +413,8 @@ async def _async_main(args: argparse.Namespace) -> int:
         return 1
 
     scheduler.start()
+    from ops.status import write_pidfile, clear_pidfile
+    write_pidfile()
     logger.info("✅  %s (%s) running. Ctrl-C to stop.", FEATURE_NAME, FEATURE_TAG)
 
     stop = asyncio.Event()
@@ -401,6 +424,7 @@ async def _async_main(args: argparse.Namespace) -> int:
     finally:
         logger.info("Shutting down scheduler...")
         scheduler.shutdown(wait=False)
+        clear_pidfile()
 
     return 0
 
@@ -449,6 +473,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mood", default="", help="Context mood for --once (morning/gym/4am/chill/sad/party/focus).",
+    )
+    parser.add_argument(
+        "--status", action="store_true",
+        help="Print ops status JSON (daemon, jobs, registry, pools, disk) and exit.",
+    )
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="60-second training wiring check: sampled frame, toy models, no registry writes.",
+    )
+    parser.add_argument(
+        "--clean-dry-run", action="store_true",
+        help="Report what catalog clean would delete. Changes nothing.",
+    )
+    parser.add_argument(
+        "--rollback", action="store_true",
+        help="Point prod at the previous registry entry and exit.",
     )
     parser.add_argument(
         "--refresh-feed", action="store_true",

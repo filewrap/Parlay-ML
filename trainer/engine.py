@@ -318,6 +318,68 @@ def set_registry(key: str, run_id: str, version: str, ndcg10: float) -> None:
         ON CONFLICT(key) DO UPDATE SET run_id=excluded.run_id, model_version=excluded.model_version,
             ndcg10=excluded.ndcg10, updated_at=excluded.updated_at
         """, (key, run_id, version, float(ndcg10), time.time()))
+        try:
+            conn.execute("INSERT INTO registry_history (key, run_id, model_version, ndcg10, updated_at)"
+                         " VALUES (?, ?, ?, ?, ?)", (key, run_id, version, float(ndcg10), time.time()))
+        except Exception:
+            pass
+
+
+def rollback_prod() -> dict:
+    """Point prod at the previous registry entry. Returns what happened."""
+    import json as _json
+    with get_conn(DB_TRAINING) as conn:
+        cur = conn.execute("SELECT run_id, model_version, ndcg10 FROM model_registry WHERE key='prod'").fetchone()
+        hist = conn.execute("SELECT run_id, model_version, ndcg10, updated_at FROM registry_history"
+                            " WHERE key='prod' ORDER BY updated_at DESC LIMIT 10").fetchall()
+    if not cur:
+        return {"status": "noop", "reason": "no prod pointer set"}
+    prev = next((dict(h) for h in hist if h["run_id"] != cur["run_id"]), None)
+    if not prev:
+        return {"status": "noop", "reason": "no earlier prod entry in history"}
+    # Verify the old models still exist before pointing at them.
+    missing = []
+    try:
+        with get_conn(DB_TRAINING) as conn:
+            arts = conn.execute("SELECT model_path FROM model_artifacts WHERE run_id=?",
+                                (prev["run_id"],)).fetchall()
+        import os as _os
+        missing = [a["model_path"] for a in arts if not _os.path.exists(a["model_path"])]
+    except Exception:
+        pass
+    set_registry("prod", prev["run_id"], prev["model_version"], float(prev["ndcg10"] or 0))
+    return {"status": "rolled-back", "from_run": cur["run_id"], "to_run": prev["run_id"],
+            "to_version": prev["model_version"], "missing_files": missing}
+
+
+def git_sha() -> str:
+    try:
+        import subprocess as _sp
+        r = _sp.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                    timeout=10, cwd=str(MODELS_DIR.parent))
+        return r.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def config_snapshot() -> str:
+    """Key constants that change model behavior. Recorded per run."""
+    import json as _json
+    import config as _c
+    keys = ["REC_CANDIDATE_POOL", "ALS_FACTORS", "ALS_ITERATIONS", "ALS_REG", "ALS_ALPHA",
+            "FEATURE_MF_FACTORS", "FEATURE_MF_EPOCHS", "FEATURE_MF_LR", "TWO_TOWER_DIM",
+            "SEQ_MAX_LEN", "NEGATIVES_PER_POSITIVE", "IMPLICIT_ALPHA", "INTERACTION_HALFLIFE_DAYS",
+            "HEARD_BOOST", "HEARD_WINDOW_DAYS", "BLENDER_LR", "BLENDER_EPOCHS"]
+    return _json.dumps({k: getattr(_c, k, None) for k in keys}, default=str)
+
+
+def _ensure_manifest_cols() -> None:
+    with get_conn(DB_TRAINING) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(training_runs)").fetchall()]
+        for col, ddl in (("git_sha", "TEXT DEFAULT ''"), ("config_json", "TEXT DEFAULT ''"),
+                         ("frame_hash", "TEXT DEFAULT ''")):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE training_runs ADD COLUMN {col} {ddl}")
 
 
 def log_artifact(run_id: str, model_name: str, model_path: str, metrics_json: str = "") -> None:
@@ -356,11 +418,15 @@ class TrainingEngine:
         version: Optional[str] = None,
         light: bool = False,
         force_ncf: bool = False,
+        smoke: bool = False,
     ) -> tuple:
         """Full MAX training run.
 
         light=True  → hourly light-train (ALS + retrievers + two-tower + sequence).
         light=False → deep-train (all + FeatureMF + SVD + weekly NCF + blender).
+        smoke=True  → 60-second wiring check: sampled frame, toy factors,
+                       cheap models only, no registry writes, no checkpoints
+                       clobbered (version forced to smoke-*).
         """
         import json as _json
         from data.interactions import build_interaction_frame, frame_to_triples
@@ -369,13 +435,15 @@ class TrainingEngine:
 
         run_id = str(uuid.uuid4())[:8]
         version = version or f"v{int(time.time())}"
+        if smoke:
+            version = f"smoke-{version}"
         started_at = time.time()
         if not _acquire_lock():
             logger.warning("Training lock held — refusing overlap (stagger the VPS).")
             return self._svd, self._ncf, {"error": "locked", "version": version}
 
         logger.info("══════════════════════════════════════════")
-        logger.info("  NeuroSync MAX Training Run [%s] light=%s", run_id, light)
+        logger.info("  NeuroSync MAX Training Run [%s] light=%s smoke=%s", run_id, light, smoke)
         logger.info("  Version: %s", version)
         logger.info("══════════════════════════════════════════")
 
@@ -399,6 +467,13 @@ class TrainingEngine:
                 frame = build_interaction_frame()
 
             train_frame, valid_frame, fp = temporal_split(frame, leave_last_n=5)
+            if smoke:
+                # Wiring check, not learning: 1500-pair sample, toy models.
+                import random as _rnd
+                _rnd.Random(0).shuffle(train_frame)
+                train_frame = train_frame[:1500]
+                valid_frame = valid_frame[:300]
+                fp = {**fp, "smoke": True}
             save_fingerprint(run_id, fp)
             triples = frame_to_triples(train_frame)
             n_users = len({d["user_id"] for d in frame})
@@ -412,26 +487,33 @@ class TrainingEngine:
             from models.sequence import SequenceModel
             from models.two_tower import TwoTower
 
-            als = ImplicitALS(version=version)
+            if smoke:
+                als = ImplicitALS(n_factors=8, n_iters=2, version=version)
+            else:
+                als = ImplicitALS(version=version)
             als_loss = als.fit(train_frame)
-            als_path = als.save()
+            als_path = als.save() if not smoke else "smoke:skipped-save"
 
             ret = RetrieverZoo(version=version)
             ret_stats = ret.fit(train_frame)
-            ret_path = ret.save()
+            ret_path = ret.save() if not smoke else "smoke:skipped-save"
 
             seq = SequenceModel(version=version)
             seq_loss = seq.fit(train_frame)
-            seq_path = seq.save()
+            seq_path = seq.save() if not smoke else "smoke:skipped-save"
 
-            tt = TwoTower(version=version)
-            tt_loss = tt.fit(train_frame)
-            tt_path = tt.save()
+            if smoke:
+                tt = TwoTower(dim=8, version=version)
+                tt_loss = tt.fit(train_frame, epochs=1)
+            else:
+                tt = TwoTower(version=version)
+                tt_loss = tt.fit(train_frame)
+            tt_path = tt.save() if not smoke else "smoke:skipped-save"
 
             # ── 4. Deep-only: FeatureMF + SVD (+ blender later) ──
             fmf_loss, fmf_path, svd_rmse, svd_path = 999.0, "", 999.0, ""
             fmf, svd = None, None
-            if not light:
+            if not light and not smoke:
                 from models.feature_mf import FeatureMF
                 fmf = FeatureMF(version=version)
                 fmf_loss = fmf.fit(train_frame)
@@ -460,7 +542,7 @@ class TrainingEngine:
             except Exception:
                 pass
             weekly_due = (time.time() - last_weekly) > 7 * 86400
-            if force_ncf or (not light and weekly_due):
+            if not smoke and (force_ncf or (not light and weekly_due)):
                 logger.info("NCF weekly training (due=%s)...", weekly_due)
                 ncf = NCFModel(version=version)
                 ncf_loss = ncf.fit(triples)
@@ -498,7 +580,7 @@ class TrainingEngine:
             ndcg10 = float(metrics.get("ndcg@10", 0.0))
 
             # ── 7. Blender fit on valid judged pairs (deep only) ──
-            if not light:
+            if not light and not smoke:
                 try:
                     from ranker.blender import Blender
                     judged = []
@@ -536,44 +618,53 @@ class TrainingEngine:
                 except Exception as e:
                     logger.warning("Blender fit skipped: %s", e)
 
-            # ── 8. Log + registry (staging vs prod) ──
+            # ── 8. Log + registry (staging vs prod) + run manifest ──
             finished_at = time.time()
+            _ensure_manifest_cols()
+            _sha, _cfg = git_sha(), config_snapshot()
             with get_conn(DB_TRAINING) as conn:
                 conn.execute("""
                 INSERT INTO training_runs
                     (run_id, started_at, finished_at, model_type, n_samples,
-                     n_users, n_songs, train_loss, val_loss, rmse, model_path, notes)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (run_id, started_at, finished_at, "max-all" if not light else "max-light",
+                     n_users, n_songs, train_loss, val_loss, rmse, model_path, notes,
+                     git_sha, config_json, frame_hash)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (run_id, started_at, finished_at,
+                      "smoke" if smoke else ("max-all" if not light else "max-light"),
                       len(train_frame), n_users, n_songs, als_loss, tt_loss, svd_rmse,
-                      str(als_path), f"metrics={metrics} rss_mb={_peak_rss_mb():.0f}"))
+                      str(als_path), f"metrics={metrics} rss_mb={_peak_rss_mb():.0f}",
+                      _sha, _cfg, fp.get("frame_hash", "")))
             for name, p in (("als", str(als_path)), ("retrievers", str(ret_path)),
                             ("sequence", str(seq_path)), ("two_tower", str(tt_path)),
                             ("feature_mf", fmf_path), ("svd", svd_path), ("ncf", ncf_path)):
-                if p:
+                if p and not p.startswith("smoke:"):
                     log_artifact(run_id, name, p, _json.dumps(metrics)[:2000])
 
-            prod_metrics = None
-            if prod:
-                try:
-                    with get_conn(DB_TRAINING) as conn:
-                        row = conn.execute("SELECT metrics_json FROM model_artifacts WHERE run_id=? AND model_name='als'",
-                                           (prod["run_id"],)).fetchone()
-                    prod_metrics = _json.loads(row["metrics_json"]) if row and row["metrics_json"] else None
-                except Exception:
-                    prod_metrics = None
-            from eval.metrics import should_promote as _sp
-            promote, reason = _sp(metrics, prod_metrics)
-            set_registry("staging", run_id, version, ndcg10)
-            if promote:
-                set_registry("prod", run_id, version, ndcg10)
-            logger.info("Eval: %s | promote=%s (%s) | peak RSS=%.0f MB", metrics, promote, reason, _peak_rss_mb())
+            promote, reason = False, "smoke: no promotion"
+            if not smoke:
+                prod_metrics = None
+                if prod:
+                    try:
+                        with get_conn(DB_TRAINING) as conn:
+                            row = conn.execute("SELECT metrics_json FROM model_artifacts WHERE run_id=? AND model_name='als'",
+                                               (prod["run_id"],)).fetchone()
+                        prod_metrics = _json.loads(row["metrics_json"]) if row and row["metrics_json"] else None
+                    except Exception:
+                        prod_metrics = None
+                from eval.metrics import should_promote as _sp
+                promote, reason = _sp(metrics, prod_metrics)
+                set_registry("staging", run_id, version, ndcg10)
+                if promote:
+                    set_registry("prod", run_id, version, ndcg10)
+            logger.info("Eval: %s | promote=%s (%s) | peak RSS=%.0f MB | sha=%s",
+                        metrics, promote, reason, _peak_rss_mb(), _sha)
 
             self.als, self.retrievers, self.sequence, self.two_tower = als, ret, seq, tt
             self.feature_mf = fmf
             elapsed = finished_at - started_at
             full_metrics = {**metrics, "version": version, "elapsed_s": round(elapsed, 2),
-                            "als_loss": round(float(als_loss), 4), "promoted": promote}
+                            "als_loss": round(float(als_loss), 4), "promoted": promote,
+                            "smoke": smoke, "git_sha": _sha}
             return self._svd, self._ncf, full_metrics
         finally:
             _release_lock()

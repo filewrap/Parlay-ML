@@ -15,6 +15,7 @@ via lock file (config.TRAIN_LOCK_FILE).
 """
 
 import asyncio
+import functools
 import logging
 import time
 
@@ -24,6 +25,25 @@ logger = logging.getLogger("parlay.scheduler")
 _pipeline = None
 _trainer = None
 _bot_push_callback = None   # async fn(user_id, recs) — your Parlay bot hook
+
+
+def _logged(name: str):
+    """Every job leaves a trace in ops.joblog (no more blind grepping)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def inner(*a, **k):
+            from ops.joblog import log_job
+            t0 = time.time()
+            try:
+                out = await fn(*a, **k)
+                log_job(name, time.time() - t0, True,
+                        str(out)[:200] if isinstance(out, (int, str)) else "")
+                return out
+            except Exception as e:
+                log_job(name, time.time() - t0, False, str(e)[:200])
+                raise
+        return inner
+    return deco
 
 
 def register(pipeline, trainer, bot_push_callback=None):
@@ -53,6 +73,7 @@ def _train_locked() -> bool:
     return False
 
 
+@_logged("feed_refresh")
 async def feed_refresh_job():
     """Hourly :00 — scrape YouTube top-100."""
     if _train_locked():
@@ -69,6 +90,7 @@ async def feed_refresh_job():
         logger.error("  feed_refresh_job FAILED: %s", e, exc_info=True)
 
 
+@_logged("feed_deep")
 async def feed_deep_job():
     """Nightly 03:30 — deep scrape 2–5k (discographies/moods/charts/related)."""
     if _train_locked():
@@ -94,6 +116,7 @@ async def feed_deep_job():
         logger.error("  feed_deep_job FAILED: %s", e, exc_info=True)
 
 
+@_logged("rec_push")
 async def rec_push_job(user_ids: list):
     """Hourly :10 — Top-10 per user (precomputed Top-200 + fresh rerank)."""
     logger.info("⏰  [JOB] rec_push_job for %d users... RSS=%.0f MB", len(user_ids), _rss_mb())
@@ -110,6 +133,7 @@ async def rec_push_job(user_ids: list):
             logger.error("  rec_push_job FAILED for user %s: %s", uid, e, exc_info=True)
 
 
+@_logged("retrain")
 async def retrain_job(light: bool = True):
     """:30 light-train or 03:00 deep-train. Never overlaps scrape (lock)."""
     kind = "light-train" if light else "deep-train"
@@ -137,6 +161,7 @@ async def retrain_job(light: bool = True):
         logger.error("  %s FAILED: %s", kind, e, exc_info=True)
 
 
+@_logged("audio_listen")
 async def audio_listen_job():
     """Nightly 02:00 — the machine listens: ~150 priority tracks → audio_features."""
     logger.info("⏰  [JOB] audio_listen_job starting... RSS=%.0f MB", _rss_mb())
@@ -152,14 +177,28 @@ async def audio_listen_job():
         logger.error("  audio_listen_job FAILED: %s", e, exc_info=True)
 
 
-async def catalog_clean_job():
-    """Daily 04:00 — purge stale + VACUUM (weekly vacuum)."""
-    logger.info("⏰  [JOB] catalog_clean_job... RSS=%.0f MB", _rss_mb())
+@_logged("catalog_clean")
+async def catalog_clean_job(dry_run: bool = False):
+    """Daily 04:00 — purge stale + VACUUM (weekly vacuum).
+
+    dry_run=True: report would-delete counts, change nothing.
+    """
+    logger.info("⏰  [JOB] catalog_clean_job%s... RSS=%.0f MB",
+                " (DRY RUN)" if dry_run else "", _rss_mb())
     try:
         from core.database import get_conn, DB_CATALOG
         from core.scraper import prune_old_feed_snapshots
         cutoff = time.time() - 7 * 86400
         with get_conn(DB_CATALOG) as conn:
+            if dry_run:
+                row = conn.execute(
+                    "SELECT COUNT(*) c FROM songs WHERE last_seen < ? AND times_fetched < 3",
+                    (cutoff,)).fetchone()
+                purged = int(row["c"]) if row else 0
+                logger.info("  DRY RUN: would purge %d stale songs (no VACUUM).", purged)
+                pruned = prune_old_feed_snapshots(dry_run=True)
+                logger.info("  DRY RUN: would prune %d old snapshots.", pruned)
+                return purged + pruned
             cur = conn.execute(
                 "DELETE FROM songs WHERE last_seen < ? AND times_fetched < 3",
                 (cutoff,)
@@ -173,9 +212,11 @@ async def catalog_clean_job():
             except Exception as e:
                 logger.warning("  VACUUM skipped: %s", e)
             logger.info("  Catalog: purged %d stale songs.", purged)
-        prune_old_feed_snapshots()
+        pruned = prune_old_feed_snapshots()
+        return purged + pruned
     except Exception as e:
         logger.error("  catalog_clean_job FAILED: %s", e, exc_info=True)
+        return 0
 
 
 def build_scheduler(user_ids: list):

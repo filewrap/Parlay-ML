@@ -15,7 +15,7 @@ from core.database import get_conn
 
 from .decode import read_wav_mono
 from .features import analyze, summarize
-from .fetch import cleanup_wav, fetch_clip
+from .fetch import cleanup_wav, fetch_any
 from .store import analyzed_ids, blocked_ids, ensure_schema, note_failure, save
 
 logger = logging.getLogger("parlay.audio.listener")
@@ -99,17 +99,34 @@ def priority_queue(limit: int = TRACKS_PER_NIGHT) -> list[tuple[str, str]]:
 
 
 def listen_one(song_id: str) -> dict | None:
-    """Fetch → hear → store → delete. Returns summary or None."""
+    """Fetch (any door) → hear → store → delete. Returns summary or None."""
+    from config import DB_CATALOG as _DBC
     wav = None
     try:
-        wav = fetch_clip(str(song_id))
+        title, artist = "", ""
+        try:
+            with get_conn(_DBC) as conn:
+                row = conn.execute("SELECT title, channel FROM songs WHERE song_id=?",
+                                   (str(song_id),)).fetchone()
+            if row:
+                title, artist = row["title"] or "", row["channel"] or ""
+        except Exception:
+            pass
+        wav, prov = fetch_any(str(song_id), title=title, artist=artist)
         if not wav:
-            note_failure(str(song_id), "no audio (blocked?)")
+            note_failure(str(song_id), "all doors closed")
             return None
         y, sr = read_wav_mono(wav)
         feat = analyze(y, sr)
         summary = summarize(feat)
+        summary["source"] = prov.get("source", "")
+        summary["clip_secs"] = prov.get("clip_secs", 0)
         save(str(song_id), summary)
+        try:
+            from .voice import fetch_and_store_lyrics
+            fetch_and_store_lyrics(str(song_id), title, artist)
+        except Exception as e:
+            logger.warning("lyrics %s: %s", song_id, str(e)[:100])
         return summary
     except Exception as e:
         logger.warning("listen %s failed: %s", song_id, e)
@@ -131,6 +148,7 @@ def listen_night(limit: int = TRACKS_PER_NIGHT) -> dict:
         return {"skipped": True}
     queue = priority_queue(limit)
     heard, failed = 0, 0
+    heard_rows: list[tuple[str, str, dict]] = []
     t0 = time.time()
     for i, (sid, title) in enumerate(queue, 1):
         if _locked():  # trainer woke up early — yield the box
@@ -139,6 +157,7 @@ def listen_night(limit: int = TRACKS_PER_NIGHT) -> dict:
         s = listen_one(sid)
         if s:
             heard += 1
+            heard_rows.append((sid, title, s))
         else:
             failed += 1
         if i % 10 == 0:
@@ -148,4 +167,11 @@ def listen_night(limit: int = TRACKS_PER_NIGHT) -> dict:
     stats = {"heard": heard, "failed": failed, "secs": round(dt, 1),
              "per_track_s": round(dt / max(heard + failed, 1), 1)}
     logger.info("🌙 Night over: %s", stats)
+    # Parlay says what it heard.
+    try:
+        from gate.announce import announce_batch
+        for msg in announce_batch(heard_rows):
+            logger.info(msg.replace("\n", " · "))
+    except Exception as e:
+        logger.warning("announce skipped: %s", e)
     return stats

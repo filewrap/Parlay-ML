@@ -202,6 +202,13 @@ def analyze(y: np.ndarray, sr: int = 16000) -> dict:
     chroma = _chroma_mean(mag, sr)
     root, mode, key_strength, alt = estimate_key(chroma)
     arc = analyze_arc(np.asarray(y, dtype=np.float32), sr, mag=mag, mode=mode)
+    try:
+        from .voice import analyze_voice
+        voice = analyze_voice(np.asarray(y, dtype=np.float32), sr)
+    except Exception:
+        voice = {"voice_pct": 0.0, "vibrato_pct": 0.0, "median_f0": 0.0,
+                 "f0_lo": 0.0, "f0_hi": 0.0, "peak_f0": 0.0, "register": "silent",
+                 "voice_enter_s": None, "presence_10s": [], "melody_10s": []}
     bpm, tempo_strength = estimate_tempo(mag, sr)
     colour = spectral_colour(mag, np.asarray(y, dtype=np.float32), sr)
     # Soft-saturation energy: mastered music sits ~0.15–0.30 RMS, quiet
@@ -225,6 +232,11 @@ def analyze(y: np.ndarray, sr: int = 16000) -> dict:
         "energy": round(energy, 3), "harmonic_clarity": clarity,
         "climax_frac": arc["climax_frac"], "lift": arc["lift"],
         "arc_arousal": arc["arousal"], "arc_valence": arc["valence"],
+        "voice_pct": voice["voice_pct"], "vibrato_pct": voice["vibrato_pct"],
+        "median_f0": voice["median_f0"], "f0_lo": voice["f0_lo"],
+        "f0_hi": voice["f0_hi"], "peak_f0": voice["peak_f0"],
+        "register": voice["register"], "voice_enter_s": voice["voice_enter_s"],
+        "melody_10s": voice["melody_10s"], "presence_10s": voice["presence_10s"],
         **colour,
     }
 
@@ -241,7 +253,17 @@ def summarize(feat: dict) -> dict:
         "key_strength": feat["key_strength"],
         "climax_frac": feat.get("climax_frac", 0.5),
         "lift": feat.get("lift", 0.0),
+        "voice_pct": feat.get("voice_pct", 0.0),
+        "vibrato_pct": feat.get("vibrato_pct", 0.0),
+        "median_f0": feat.get("median_f0", 0.0),
+        "f0_lo": feat.get("f0_lo", 0.0),
+        "f0_hi": feat.get("f0_hi", 0.0),
+        "peak_f0": feat.get("peak_f0", 0.0),
+        "register": feat.get("register", ""),
+        "voice_enter_s": feat.get("voice_enter_s") if feat.get("voice_enter_s") is not None else -1,
         "arc_arousal": ",".join(f"{v:.3f}" for v in feat.get("arc_arousal", [])),
         "arc_valence": ",".join(f"{v:.3f}" for v in feat.get("arc_valence", [])),
+        "melody_10s": ",".join(f"{v:.1f}" for v in feat.get("melody_10s", [])),
+        "presence_10s": ",".join(f"{v:.3f}" for v in feat.get("presence_10s", [])),
         "chroma": ",".join(f"{v:.3f}" for v in feat["chroma"]),
     }

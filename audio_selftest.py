@@ -127,6 +127,80 @@ def main() -> None:
         conn.execute("DELETE FROM songs WHERE song_id='_heard_probe'")
         conn.execute("DELETE FROM audio_features WHERE song_id='_heard_probe'")
         conn.execute("DELETE FROM audio_arcs WHERE song_id='_heard_probe'")
+        conn.execute("DELETE FROM listen_ledger WHERE song_id='_heard_probe'")
+
+    # 11. Title gate: same-artist wrong-song must not pass.
+    from audio.sources import title_ok, rank_candidates
+    assert title_ok("4AM in Karachi", "4AM in Karachi") is True
+    assert title_ok("4AM in Karachi", "Afsanay") is False
+    assert title_ok("4AM in Karachi", "5AM In Lahore") is False
+    assert title_ok("Mehrama", "Mehrama - Official Lyric Video") is True
+    ranked = rank_candidates("4AM in Karachi", "Talha Anjum", [
+        {"title": "Afsanay", "artist": "Talha Anjum"},
+        {"title": "4AM in Karachi", "artist": "Talha Anjum"}])
+    assert ranked[0]["title"] == "4AM in Karachi", ranked
+    print("title gate ok")
+
+    # 12. The Gate: ledger, graph, emotion, feel, brief.
+    from gate.state import record_listen, taste_graph
+    from gate import emotion_now, feel_like, agent_brief, taste_profile
+    from gate import emotion_now, feel_like, agent_brief, taste_profile
+    lid = record_listen("_gate_probe", "Probe", {"bpm": 100, "key": "C",
+                        "mode": "major", "valence": 0.5, "energy": 0.5,
+                        "danceability": 0.5, "source": "probe"}, "probe caption")
+    assert lid > 0
+    g = taste_graph()
+    assert g["n_listens"] >= 1 and len(g["nodes"]) > 0 and len(g["edges"]) >= 0
+    emo = emotion_now()
+    assert emo["n"] >= 1 and "label" in emo
+    fl = feel_like(mood="low", limit=2)
+    assert len(fl) >= 1 and fl == sorted(fl, key=lambda x: -x["feel_score"])
+    tp = taste_profile()
+    assert tp["n"] >= 1 and "home_key" in tp
+    brief = agent_brief()
+    assert "measured" in brief and "Mood" not in brief  # lowercase mood line present
+    assert "mood now:" in brief
+    from core.database import get_conn as _gc2
+    from config import DB_CATALOG as _DBC2
+    with _gc2(_DBC2) as conn:
+        conn.execute("DELETE FROM listen_ledger WHERE song_id='_gate_probe'")
+    print("gate ok: emotion=%s taste_home=%s" % (emo["label"], tp["home_key"]))
+
+    # 13. Voice: wobble sings, drone doesn't, silence is silent.
+    from audio.voice import analyze_voice, align_lyrics
+    t = np.arange(SR * 6) / SR
+    drone = (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    # Naturalistic vibrato: +-35 cents at 5.5Hz (a real throat, not a siren).
+    wobble = (0.5 * np.sin(2 * np.pi * (220 * t + 1.1 * np.sin(2 * np.pi * 5.5 * t)))).astype(np.float32)
+    vd = analyze_voice(drone, SR)
+    vv = analyze_voice(wobble, SR)
+    vs = analyze_voice(np.zeros(SR * 3, dtype=np.float32), SR)
+    assert vd["voice_pct"] > 0.5, vd
+    assert vv["vibrato_pct"] > vd["vibrato_pct"], (vv["vibrato_pct"], vd["vibrato_pct"])
+    assert vs["voice_pct"] == 0.0 and vs["register"] == "silent", vs
+    assert 100 < vv["median_f0"] < 400, vv
+    print("voice ok: drone voiced=%.2f vib=%.2f / wobble vib=%.2f / med=%.0fHz" % (
+        vd["voice_pct"], vd["vibrato_pct"], vv["vibrato_pct"], vv["median_f0"]))
+
+    # 14. Words: synced lyrics when the network allows, graceful without.
+    from audio.voice import fetch_lyrics
+    lyr = fetch_lyrics("Lord Huron", "The Night We Met")
+    if lyr.get("synced"):
+        assert lyr["synced"][0]["t"] >= 0 and "line" in lyr["synced"][0]
+        al = align_lyrics(lyr["synced"][:4], [0.1, 0.1, 0.1, 0.2, 0.2, 0.6, 0.7])
+        assert al[0]["section"] == "verse" and al[-1]["section"] == "chorus", al
+        print("lyrics ok: %d synced lines, e.g. %r" % (len(lyr["synced"]), lyr["synced"][0]["line"][:40]))
+    else:
+        print("lyrics skipped (offline): %s" % lyr.get("error", "?")[:60])
+
+    # 15. Caption speaks of the singer too.
+    from audio.caption import caption as _cap2
+    cs = _cap2({"bpm": 91, "key": "E", "mode": "major", "valence": 0.49,
+                "energy": 0.24, "brightness": 0.2, "harmonic_clarity": 0.39,
+                "lift": 0.45, "climax_frac": 0.72, "voice_pct": 0.3,
+                "voice_enter_s": 31, "register": "low", "peak_f0": 440.0})
+    assert "voice" in cs and "31s" in cs, cs
+    print("voice caption ok:", cs[:100])
 
     print("ALL AUDIO SELFTESTS PASSED")
 
